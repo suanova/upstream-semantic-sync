@@ -4,6 +4,7 @@ description: |
   Map upstream code architecture to the downstream codebase. Maintains a
   living mapping of modules, abstractions, and patterns so that upstream
   changes can be translated to their downstream equivalents.
+handler: local
 inputs:
   - name: upstream_paths
     type: list[string]
