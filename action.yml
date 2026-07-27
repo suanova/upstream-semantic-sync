@@ -45,9 +45,9 @@ inputs:
     required: false
     default: ''
   model:
-    description: 'Model ID for skill execution'
+    description: 'Model ID for skill execution. Pass from secret: ${{ secrets.ANTHROPIC_MODEL }}. Falls back to claude-sonnet-5 if empty.'
     required: false
-    default: 'claude-sonnet-5-20250514'
+    default: 'claude-sonnet-5'
   github_token:
     description: 'GitHub token for git push and PR creation (pass github.token from the workflow)'
     required: true

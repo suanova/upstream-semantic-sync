@@ -8,7 +8,7 @@
 #   docker run --rm \
 #     -e ANTHROPIC_AUTH_TOKEN=<token> \
 #     -e ANTHROPIC_BASE_URL=http://127.0.0.1:8080 \
-#     -e ANTHROPIC_MODEL=claude-sonnet-5-20250514 \
+#     -e ANTHROPIC_MODEL=claude-sonnet-5 \
 #     -e GITHUB_TOKEN=<token> \
 #     -v /path/to/repo:/repo \
 #     upstream-semantic-sync \

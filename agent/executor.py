@@ -19,7 +19,7 @@ import yaml
 
 log = logging.getLogger("sync.executor")
 
-DEFAULT_MODEL = "claude-sonnet-5-20250514"
+DEFAULT_MODEL = "claude-sonnet-5"
 
 
 class SkillError(Exception):
@@ -38,7 +38,7 @@ class Executor:
         # Env vars:
         #   ANTHROPIC_AUTH_TOKEN  — API key (required)
         #   ANTHROPIC_BASE_URL    — custom endpoint, e.g. http://127.0.0.1:8080
-        #   ANTHROPIC_MODEL       — model ID (default: claude-sonnet-5-20250514)
+        #   ANTHROPIC_MODEL       — model ID (default: claude-sonnet-5)
         auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
         if not auth_token:
             raise SkillError(

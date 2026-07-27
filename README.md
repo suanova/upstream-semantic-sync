@@ -102,6 +102,8 @@ jobs:
       - uses: your-org/upstream-semantic-sync@v1
         with:
           anthropic_auth_token: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          anthropic_base_url: ${{ secrets.ANTHROPIC_BASE_URL }}
+          model: ${{ secrets.ANTHROPIC_MODEL }}
           github_token: ${{ github.token }}
           upstream_repo: 'https://github.com/upstream/repo'
           # since_last defaults to true — syncs all new commits
@@ -114,17 +116,24 @@ jobs:
 - uses: your-org/upstream-semantic-sync@v1
   with:
     anthropic_auth_token: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+    anthropic_base_url: ${{ secrets.ANTHROPIC_BASE_URL }}
+    model: ${{ secrets.ANTHROPIC_MODEL }}
     github_token: ${{ github.token }}
     upstream_repo: 'https://github.com/upstream/repo'
     since_last: 'false'
     commit: 'abc1234'
 ```
 
-> **Required secret:** Add `ANTHROPIC_AUTH_TOKEN` as a repository or
-> organization secret. The skills that power the pipeline (analyze,
-> transform, build-fix) call the Anthropic API, so the auth token must
-> be available. `GITHUB_TOKEN` is provided automatically by Actions
-> and is used for git push and PR creation — no extra setup needed.
+> **Required secrets:** Add these as repository or organization secrets
+> (**Settings → Secrets and variables → Actions**):
+>
+> | Secret | Required | Description |
+> |--------|----------|-------------|
+> | `ANTHROPIC_AUTH_TOKEN` | Yes | API key for the Anthropic API or proxy |
+> | `ANTHROPIC_BASE_URL` | No | Custom endpoint (e.g. `http://127.0.0.1:8080`). Omit for default. |
+> | `ANTHROPIC_MODEL` | No | Model ID (e.g. `claude-sonnet-5`). Defaults to `claude-sonnet-5`. |
+>
+> `GITHUB_TOKEN` is automatic — used for git push and PR creation.
 
 #### Bootstrap: setting the initial SHA
 
@@ -138,27 +147,13 @@ On first run, there's no last-synced SHA yet. You have two options:
      "https://github.com/upstream/repo#main": "the-sha-your-fork-is-based-on"
    ```
 
-#### Custom endpoint / model
-
-To point at a proxy or local gateway instead of the default Anthropic API:
-
-```yaml
-- uses: your-org/upstream-semantic-sync@v1
-  with:
-    anthropic_auth_token: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
-    anthropic_base_url: 'http://127.0.0.1:8080'
-    model: 'claude-sonnet-5-20250514'
-    github_token: ${{ github.token }}
-    upstream_repo: 'https://github.com/upstream/repo'
-```
-
 ### Docker
 
 ```bash
 docker run --rm \
   -e ANTHROPIC_AUTH_TOKEN=<token> \
   -e ANTHROPIC_BASE_URL=http://127.0.0.1:8080 \
-  -e ANTHROPIC_MODEL=claude-sonnet-5-20250514 \
+  -e ANTHROPIC_MODEL=claude-sonnet-5 \
   -e GITHUB_TOKEN=<token> \
   -v /path/to/repo:/repo \
   upstream-semantic-sync \
