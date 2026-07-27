@@ -29,7 +29,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy agent code
+# Copy entrypoint and agent code
+COPY entrypoint.sh .
 COPY agent/ agent/
 COPY skills/ skills/
 COPY knowledge/ knowledge/
@@ -37,4 +38,4 @@ COPY knowledge/ knowledge/
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-ENTRYPOINT ["python", "-m", "agent.runtime"]
+ENTRYPOINT ["/app/entrypoint.sh"]

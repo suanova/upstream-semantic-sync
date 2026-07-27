@@ -277,6 +277,11 @@ def run_sync_since_last(
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # GitHub Actions' conditional expressions produce empty strings ""
+    # for omitted args. Filter them out before argparse sees them.
+    import sys
+    sys.argv = [a for a in sys.argv if a != ""]
+
     parser = argparse.ArgumentParser(description="Semantic upstream sync agent")
     parser.add_argument("--repo", required=True, help="Downstream repo path or URL")
     parser.add_argument("--upstream", required=True, help="Upstream repo URL")

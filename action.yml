@@ -97,6 +97,10 @@ runs:
     UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
     MAX_RISK: ${{ inputs.max_risk }}
     DRY_RUN: ${{ inputs.dry_run }}
+    INPUT_SINCE_LAST: ${{ inputs.since_last }}
+    INPUT_COMMIT: ${{ inputs.commit }}
+    INPUT_RANGE: ${{ inputs.range }}
+    INPUT_DRY_RUN: ${{ inputs.dry_run }}
   args:
     - '--repo'
     - '/github/workspace'
@@ -104,11 +108,11 @@ runs:
     - ${{ inputs.upstream_repo }}
     - '--branch'
     - ${{ inputs.upstream_branch }}
-    - ${{ inputs.since_last == 'true' && !inputs.commit && !inputs.range && '--since-last' || '' }}
-    - ${{ inputs.commit && '--commit' || '' }}
-    - ${{ inputs.commit || '' }}
-    - ${{ inputs.range && '--range' || '' }}
-    - ${{ inputs.range || '' }}
+    - ${{ inputs.since_last == 'true' && inputs.commit == '' && inputs.range == '' && '--since-last' || '' }}
+    - ${{ inputs.commit != '' && '--commit' || '' }}
+    - ${{ inputs.commit }}
+    - ${{ inputs.range != '' && '--range' || '' }}
+    - ${{ inputs.range }}
     - ${{ inputs.dry_run == 'true' && '--dry-run' || '' }}
     - '--json'
 
