@@ -112,6 +112,7 @@ def stage_create_pr(
     transformations: dict,
     build_result: dict,
     branch_name: str,
+    repo_path: str,
 ) -> dict:
     """Stage 5: Create a pull request with the synced changes."""
     log.info("Creating PR for upstream %s", commit_sha)
@@ -120,6 +121,7 @@ def stage_create_pr(
         inputs={
             "branch_name": branch_name,
             "upstream_ref": commit_sha,
+            "repo_path": repo_path,
             "analysis": analysis,
             "transformations": transformations,
             "build_result": build_result,
@@ -175,7 +177,8 @@ def run_sync(
         # 5. Create PR
         branch_name = f"sync/upstream-{commit_sha[:12]}"
         pr_out = stage_create_pr(
-            executor, commit_sha, analysis, transform_out, build_out, branch_name
+            executor, commit_sha, analysis, transform_out, build_out,
+            branch_name, downstream_repo,
         )
         result.pr_url = pr_out.get("pr_url", "")
         result.pr_number = pr_out.get("pr_number", 0)

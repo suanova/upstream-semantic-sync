@@ -133,12 +133,16 @@ class Executor:
     def _run_local(self, skill_name: str, inputs: dict[str, Any]) -> dict[str, Any]:
         """Run a skill as a local Python function (no LLM needed).
 
-        Used for deterministic skills like architecture_mapping where
-        the logic can be expressed as code rather than a prompt.
+        Used for deterministic skills like architecture_mapping and
+        create_pr where the logic is better expressed as code than as
+        an LLM prompt (e.g. git operations, API calls).
         """
 
         if skill_name == "architecture_mapping":
             return self._run_architecture_mapping(inputs)
+
+        if skill_name == "create_pr":
+            return self._run_create_pr(inputs)
 
         raise SkillError(f"No local handler for skill: {skill_name}")
 
@@ -195,6 +199,20 @@ class Executor:
             "unmapped": unmapped,
             "new_mappings": new_mappings,
         }
+
+    def _run_create_pr(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Create a PR using the local Python handler (git + GitHub API)."""
+
+        from agent.pr import create_pr
+
+        return create_pr(
+            repo_path=inputs.get("repo_path", ""),
+            branch_name=inputs.get("branch_name", ""),
+            upstream_ref=inputs.get("upstream_ref", ""),
+            analysis=inputs.get("analysis", {}),
+            transformations=inputs.get("transformations", {}),
+            build_result=inputs.get("build_result", {}),
+        )
 
     # ── Prompt rendering ─────────────────────────────────────────────────────
 

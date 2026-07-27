@@ -121,8 +121,8 @@ jobs:
 > **Required secret:** Add `ANTHROPIC_AUTH_TOKEN` as a repository or
 > organization secret. The skills that power the pipeline (analyze,
 > transform, build-fix) call the Anthropic API, so the auth token must
-> be available. `GITHUB_TOKEN` is provided automatically by Actions for
-> PR creation.
+> be available. `GITHUB_TOKEN` is provided automatically by Actions
+> and is used for git push and PR creation — no extra setup needed.
 
 #### Bootstrap: setting the initial SHA
 

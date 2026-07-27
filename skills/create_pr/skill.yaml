@@ -4,6 +4,7 @@ description: |
   Create a pull request with the synced upstream changes, including
   a structured description that traces back to the upstream commit
   and explains the transformation.
+handler: local
 inputs:
   - name: branch_name
     type: string
@@ -13,6 +14,10 @@ inputs:
     type: string
     required: true
     description: Upstream commit SHA or range being synced
+  - name: repo_path
+    type: string
+    required: true
+    description: Path to the downstream repo on disk
   - name: analysis
     type: object
     required: true
