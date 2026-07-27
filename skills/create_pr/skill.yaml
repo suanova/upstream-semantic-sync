@@ -1,0 +1,39 @@
+name: create_pr
+version: "1.0"
+description: |
+  Create a pull request with the synced upstream changes, including
+  a structured description that traces back to the upstream commit
+  and explains the transformation.
+inputs:
+  - name: branch_name
+    type: string
+    required: true
+    description: Name for the sync branch
+  - name: upstream_ref
+    type: string
+    required: true
+    description: Upstream commit SHA or range being synced
+  - name: analysis
+    type: object
+    required: true
+    description: Output from analyze_commit
+  - name: transformations
+    type: object
+    required: true
+    description: Output from transform_code
+  - name: build_result
+    type: object
+    required: true
+    description: Output from build_fix
+  - name: labels
+    type: list[string]
+    required: false
+    default: [upstream-sync]
+    description: Labels to apply to the PR
+outputs:
+  - name: pr_url
+    type: string
+    description: URL of the created pull request
+  - name: pr_number
+    type: integer
+    description: Number of the created pull request

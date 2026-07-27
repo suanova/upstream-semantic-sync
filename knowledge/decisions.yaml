@@ -1,0 +1,67 @@
+# Sync Decisions & Policy
+#
+# Controls when and how the sync agent operates. These are policy decisions
+# that don't belong in code — they express the team's intent about what
+# to auto-sync and what requires human intervention.
+
+# ── Auto-sync risk policy ────────────────────────────────────────────────────
+# Maximum risk level that will be auto-synced without manual approval.
+# Options: low, medium, high
+# "low"    → only internal changes auto-sync
+# "medium" → features and bugfixes auto-sync, breaking changes need approval
+# "high"   → everything auto-syncs (use with caution)
+
+max_auto_risk: medium
+
+# ── Change type policy ───────────────────────────────────────────────────────
+# Change types to skip entirely (never sync, even manually via this agent).
+# Useful for upstream changes that are irrelevant to the downstream fork.
+
+skip_change_types:
+  - internal  # upstream-only infra/build changes
+
+# ── Commit skip list ─────────────────────────────────────────────────────────
+# Specific commit SHA prefixes to skip. Used when an upstream commit is
+# known to be incompatible and a different solution was applied downstream.
+
+skip_commits: []
+  # Example:
+  # - "a1b2c3d"  # upstream introduced a dependency we can't use
+
+# ── Dependency overrides ─────────────────────────────────────────────────────
+# When git's topological order isn't correct for downstream (e.g., a
+# downstream fork has already partially synced a later commit), override
+# the ordering here.
+
+dependency_overrides: {}
+  # Example:
+  # "sha-of-commit-b":
+  #   depends_on: "sha-of-commit-a"
+  #   reason: "B extends the API introduced in A"
+
+# ── Fork divergence markers ──────────────────────────────────────────────────
+# When downstream code contains these markers, the sync agent will not
+# overwrite those regions and will flag them for manual review.
+
+fork_divergence_marker: "SYNC:FORK_DIVERGED"
+manual_review_marker: "SYNC:MANUAL"
+
+# ── PR settings ──────────────────────────────────────────────────────────────
+
+pr:
+  base_branch: main
+  labels:
+    - upstream-sync
+  draft_on_conflict: true       # create as draft if there are conflicts
+  auto_merge: false             # never auto-merge, always require review
+  reviewers: []                 # add specific reviewers
+  # team_reviewers:              # or team reviewers
+  #   - core-team
+
+# ── Notification settings ────────────────────────────────────────────────────
+
+notifications:
+  on_breaking: true             # notify on breaking change sync
+  on_build_fail: true           # notify when build fix can't resolve errors
+  on_new_mapping: true          # notify when new mapping candidates are found
+  channel: ""                   # slack channel or webhook URL

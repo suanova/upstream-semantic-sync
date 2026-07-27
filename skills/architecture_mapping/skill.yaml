@@ -1,0 +1,25 @@
+name: architecture_mapping
+version: "1.0"
+description: |
+  Map upstream code architecture to the downstream codebase. Maintains a
+  living mapping of modules, abstractions, and patterns so that upstream
+  changes can be translated to their downstream equivalents.
+inputs:
+  - name: upstream_paths
+    type: list[string]
+    required: true
+    description: Upstream file paths affected by the change
+  - name: change_type
+    type: string
+    required: true
+    description: The classified change type from analyze_commit
+outputs:
+  - name: downstream_targets
+    type: list[object]
+    description: Downstream files and transformations needed
+  - name: unmapped
+    type: list[string]
+    description: Upstream paths with no known downstream equivalent
+  - name: new_mappings
+    type: list[object]
+    description: Newly discovered mappings to persist

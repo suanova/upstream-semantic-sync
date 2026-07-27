@@ -1,0 +1,41 @@
+name: analyze_commit
+version: "1.0"
+description: |
+  Analyze an upstream commit to extract semantic intent, affected surfaces,
+  and migration signals. Produces a structured analysis that downstream
+  skills consume.
+inputs:
+  - name: commit_sha
+    type: string
+    required: true
+    description: SHA of the upstream commit to analyze
+  - name: repo_url
+    type: string
+    required: true
+    description: Upstream repository URL
+  - name: branch
+    type: string
+    required: false
+    default: main
+    description: Branch containing the commit
+outputs:
+  - name: intent
+    type: string
+    description: One-line semantic summary of the commit's purpose
+  - name: affected_paths
+    type: list[string]
+    description: Files changed by the commit
+  - name: change_type
+    type: enum
+    values: [feature, bugfix, refactor, breaking, deprecation, internal]
+    description: Classified change type
+  - name: surfaces
+    type: list[string]
+    description: Public API / behavioral surfaces affected
+  - name: risk
+    type: enum
+    values: [low, medium, high]
+    description: Estimated sync risk
+  - name: dependencies
+    type: list[string]
+    description: Other commits this one depends on

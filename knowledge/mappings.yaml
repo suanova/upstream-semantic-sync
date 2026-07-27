@@ -1,0 +1,73 @@
+# Architecture Mappings
+#
+# Living document that maps upstream code structures to their downstream
+# equivalents. Updated automatically by the sync agent when new mappings
+# are discovered, and manually when fork divergence is detected.
+
+# ── Module-level mappings ────────────────────────────────────────────────────
+# Key: upstream module path prefix
+# Value: downstream equivalent + metadata
+
+modules: {}
+  # Example:
+  # "upstream_lib/core/":
+  #   downstream: "our_lib/foundation/"
+  #   confidence: high
+  #   auto_discovered: false
+  #   reason: "Core module was renamed during initial fork"
+
+# ── Surface (symbol) mappings ────────────────────────────────────────────────
+# Key: upstream fully-qualified symbol name
+# Value: downstream equivalent + metadata
+
+surfaces: {}
+  # Example:
+  # "upstream_lib.core.Client":
+  #   downstream: "our_lib.foundation.SyncClient"
+  #   confidence: high
+  #   auto_discovered: false
+  #   reason: "Client renamed to SyncClient to distinguish from AsyncClient"
+
+# ── Config key mappings ──────────────────────────────────────────────────────
+# Upstream config keys that differ downstream
+
+config_keys: {}
+  # Example:
+  # "upstream.log_level":
+  #   downstream: "logging.level"
+  # "upstream.max_retries":
+  #   downstream: "retry.max_attempts"
+
+# ── Type alias mappings ──────────────────────────────────────────────────────
+# Upstream types that map to different downstream types
+
+type_aliases: {}
+  # Example:
+  # "upstream_lib.types.Result":
+  #   downstream: "our_lib.types.Outcome"
+  # "upstream_lib.errors.UpstreamError":
+  #   downstream: "our_lib.errors.DownstreamError"
+
+# ── Import path rewrites ─────────────────────────────────────────────────────
+# Patterns for rewriting import statements
+
+import_rewrites: {}
+  # Example:
+  # "from upstream_lib.core import":
+  #   rewrite: "from our_lib.foundation import"
+  # "import upstream_lib.utils":
+  #   rewrite: "import our_lib.helpers"
+
+# ── Sync state ───────────────────────────────────────────────────────────────
+# Tracks the last upstream commit SHA that was successfully synced,
+# keyed by "upstream_repo_url#branch". Used by --since-last mode
+# to determine what's new since the last scheduled run.
+#
+# Updated automatically after each successful sync.
+
+sync_state: {}
+  # Example after first sync:
+  # "https://github.com/upstream/repo#main": "a1b2c3d4e5f6..."
+  #
+  # To bootstrap: run with --commit <initial-sha> once, or set manually:
+  # "https://github.com/upstream/repo#main": "the-sha-your-fork-is-based-on"

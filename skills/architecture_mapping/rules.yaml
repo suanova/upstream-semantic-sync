@@ -1,0 +1,113 @@
+# Architecture Mapping Rules
+#
+# These rules govern how upstream code structures are mapped to their
+# downstream equivalents. Rules are evaluated top-to-bottom; first match wins.
+
+rules:
+  # ── Module mapping ──────────────────────────────────────────────
+  - id: module_prefix_rewrite
+    description: |
+      When upstream uses one module prefix and downstream uses another,
+      rewrite import paths accordingly.
+    match:
+      upstream_pattern: "upstream_lib.core.*"
+    action:
+      rewrite: "our_lib.foundation.*"
+      confidence: high
+
+  - id: module_fork_divergence
+    description: |
+      When a downstream fork has intentionally diverged from upstream,
+      flag for manual review instead of auto-mapping.
+    match:
+      upstream_pattern: "*"
+      downstream_has_marker: "SYNC:FORK_DIVERGED"
+    action:
+      flag: manual_review
+      reason: "Downstream fork has explicitly diverged"
+
+  - id: module_internal_skip
+    description: |
+      Upstream-internal packages (tests, benchmarks, build scripts)
+      are not mapped unless the downstream has an equivalent.
+    match:
+      upstream_pattern: "{test,bench,build,internal}/**"
+      downstream_equivalent: absent
+    action:
+      skip: true
+      reason: "Internal upstream code with no downstream equivalent"
+
+  # ── Surface mapping ─────────────────────────────────────────────
+  - id: surface_rename
+    description: |
+      When an upstream exported symbol has been renamed downstream,
+      map to the renamed symbol.
+    match:
+      upstream_symbol: "*"
+      mapping_in: "knowledge/mappings.yaml"
+    action:
+      rewrite_symbol: from_mappings
+      confidence: high
+
+  - id: surface_new
+    description: |
+      When an upstream surface has no downstream mapping at all,
+      flag it as a new addition that needs a home.
+    match:
+      upstream_symbol: "*"
+      mapping_in: "knowledge/mappings.yaml"
+      found: false
+    action:
+      flag: new_surface
+      reason: "Upstream surface has no downstream equivalent"
+
+  # ── Pattern mapping ─────────────────────────────────────────────
+  - id: pattern_error_type
+    description: |
+      Map upstream error types to downstream error types. Downstream
+      may use a different error hierarchy or error library.
+    match:
+      upstream_pattern: "raise UpstreamError(*)"
+    action:
+      rewrite: "raise DownstreamError(*)"
+      preserve_args: true
+
+  - id: pattern_config_key
+    description: |
+      Map upstream config keys to downstream config keys. Keys may
+      be renamed or nested differently downstream.
+    match:
+      upstream_pattern: "config[\"upstream_key\"]"
+    action:
+      lookup: "knowledge/mappings.yaml#config_keys"
+      default: flag_manual_review
+
+  # ── Risk rules ──────────────────────────────────────────────────
+  - id: risk_breaking_override
+    description: |
+      Breaking changes are always high risk regardless of other rules.
+    match:
+      change_type: breaking
+    action:
+      set_risk: high
+      require: manual_approval
+
+  - id: risk_deprecation_override
+    description: |
+      Deprecations are medium risk — they compile but signal future breaks.
+    match:
+      change_type: deprecation
+    action:
+      set_risk: medium
+      require: human_notification
+
+  # ── Default ─────────────────────────────────────────────────────
+  - id: default_passthrough
+    description: |
+      If no other rule matches, pass through the path unchanged and
+      flag for review.
+    match:
+      upstream_pattern: "*"
+    action:
+      passthrough: true
+      flag: review_if_mapped

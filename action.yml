@@ -1,0 +1,120 @@
+# ── upstream-semantic-sync GitHub Action ─────────────────────────────────────
+# Automatically syncs upstream changes into a downstream fork using
+# semantic analysis and architecture-aware transformation.
+#
+# Typical scheduled usage (syncs everything since last run):
+#
+#   on:
+#     schedule:
+#       - cron: '0 6 * * 1'   # weekly on Monday at 6am
+#
+#   jobs:
+#     sync:
+#       runs-on: ubuntu-latest
+#       steps:
+#         - uses: actions/checkout@v4
+#         - uses: upstream-semantic-sync@v1
+#           with:
+#             anthropic_auth_token: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+#             upstream_repo: 'https://github.com/upstream/repo'
+#
+# One-off usage (sync a specific commit):
+#
+#   - uses: upstream-semantic-sync@v1
+#     with:
+#       anthropic_auth_token: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+#       upstream_repo: 'https://github.com/upstream/repo'
+#       commit: 'abc1234'
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: 'Upstream Semantic Sync'
+description: 'Sync upstream changes to a downstream fork using semantic analysis'
+author: 'upstream-semantic-sync'
+
+inputs:
+  anthropic_auth_token:
+    description: 'Anthropic API key for LLM-powered skills (analyze, transform, build-fix)'
+    required: true
+  anthropic_base_url:
+    description: 'Custom Anthropic API endpoint (e.g. http://127.0.0.1:8080 for a proxy)'
+    required: false
+    default: ''
+  model:
+    description: 'Model ID for skill execution'
+    required: false
+    default: 'claude-sonnet-5-20250514'
+  upstream_repo:
+    description: 'Upstream repository URL'
+    required: true
+  upstream_branch:
+    description: 'Upstream branch to track'
+    required: false
+    default: 'main'
+  since_last:
+    description: |
+      Sync all upstream commits since the last synced SHA.
+      Default true for scheduled runs. Set to 'false' if using --commit/--range.
+    required: false
+    default: 'true'
+  commit:
+    description: 'Specific upstream commit SHA to sync (overrides since_last)'
+    required: false
+    default: ''
+  range:
+    description: 'Commit range to sync (sha1..sha2, overrides since_last)'
+    required: false
+    default: ''
+  max_risk:
+    description: 'Maximum risk level to auto-sync (low, medium, high)'
+    required: false
+    default: 'medium'
+  dry_run:
+    description: 'Stop before creating PR (for testing)'
+    required: false
+    default: 'false'
+  knowledge_dir:
+    description: 'Path to knowledge directory (mappings, decisions)'
+    required: false
+    default: 'knowledge'
+
+outputs:
+  pr_url:
+    description: 'URL of the created pull request'
+    value: ${{ steps.sync.outputs.pr_url }}
+  pr_number:
+    description: 'Number of the created pull request'
+    value: ${{ steps.sync.outputs.pr_number }}
+  result:
+    description: 'JSON result of the sync pipeline'
+    value: ${{ steps.sync.outputs.result }}
+
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
+  env:
+    ANTHROPIC_AUTH_TOKEN: ${{ inputs.anthropic_auth_token }}
+    ANTHROPIC_BASE_URL: ${{ inputs.anthropic_base_url }}
+    ANTHROPIC_MODEL: ${{ inputs.model }}
+    GITHUB_TOKEN: ${{ github.token }}
+    UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+    UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+    MAX_RISK: ${{ inputs.max_risk }}
+    DRY_RUN: ${{ inputs.dry_run }}
+  args:
+    - '--repo'
+    - ${{ github.workspace }}
+    - '--upstream'
+    - ${{ inputs.upstream_repo }}
+    - '--branch'
+    - ${{ inputs.upstream_branch }}
+    - ${{ inputs.since_last == 'true' && !inputs.commit && !inputs.range && '--since-last' || '' }}
+    - ${{ inputs.commit && '--commit' || '' }}
+    - ${{ inputs.commit || '' }}
+    - ${{ inputs.range && '--range' || '' }}
+    - ${{ inputs.range || '' }}
+    - ${{ inputs.dry_run == 'true' && '--dry-run' || '' }}
+    - '--json'
+
+branding:
+  icon: 'git-pull-request'
+  color: 'blue'

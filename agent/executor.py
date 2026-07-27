@@ -1,0 +1,247 @@
+"""
+upstream-semantic-sync — Executor
+
+Runs individual skills by loading their prompt templates, interpolating
+inputs, and invoking the LLM (or a local function for deterministic skills).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+from pathlib import Path
+from typing import Any
+
+import anthropic
+import yaml
+
+log = logging.getLogger("sync.executor")
+
+DEFAULT_MODEL = "claude-sonnet-5-20250514"
+
+
+class SkillError(Exception):
+    """Raised when a skill fails to execute."""
+
+
+class Executor:
+    """Executes skills by rendering prompts and running them."""
+
+    def __init__(self, skills_dir: Path, knowledge_dir: Path) -> None:
+        self.skills_dir = skills_dir
+        self.knowledge_dir = knowledge_dir
+
+        # Initialize the Anthropic client.
+        #
+        # Env vars:
+        #   ANTHROPIC_AUTH_TOKEN  — API key (required)
+        #   ANTHROPIC_BASE_URL    — custom endpoint, e.g. http://127.0.0.1:8080
+        #   ANTHROPIC_MODEL       — model ID (default: claude-sonnet-5-20250514)
+        auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        if not auth_token:
+            raise SkillError(
+                "ANTHROPIC_AUTH_TOKEN is not set. "
+                "Export it or add it as a repository secret in your Action workflow."
+            )
+
+        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        client_kwargs: dict[str, Any] = {"api_key": auth_token}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+
+        self.client = anthropic.Anthropic(**client_kwargs)
+        self.model = os.environ.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
+
+    # ── Public API ───────────────────────────────────────────────────────────
+
+    def run_skill(self, skill_name: str, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Run a named skill with the given inputs. Returns parsed JSON output."""
+
+        skill_dir = self.skills_dir / skill_name
+        if not skill_dir.exists():
+            raise SkillError(f"Unknown skill: {skill_name}")
+
+        # Load skill metadata
+        meta = self._load_skill_meta(skill_dir)
+
+        # Load and render the prompt template
+        prompt = self._render_prompt(skill_dir, inputs)
+
+        log.info(
+            "Running skill %s (version %s)",
+            meta.get("name", skill_name),
+            meta.get("version", "unknown"),
+        )
+
+        # Determine execution mode
+        handler = meta.get("handler", "llm")
+
+        if handler == "llm":
+            output = self._run_llm(prompt, meta)
+        elif handler == "local":
+            output = self._run_local(skill_name, inputs)
+        else:
+            raise SkillError(f"Unknown handler type: {handler}")
+
+        return output
+
+    # ── LLM execution ───────────────────────────────────────────────────────
+
+    def _run_llm(self, prompt: str, meta: dict[str, Any]) -> dict[str, Any]:
+        """Invoke Claude via the Anthropic Python SDK and parse structured JSON output."""
+
+        model = meta.get("model", self.model)
+        max_tokens = meta.get("max_tokens", 8192)
+        timeout = meta.get("timeout", 120)
+
+        try:
+            response = self.client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                messages=[
+                    {"role": "user", "content": prompt},
+                ],
+            )
+        except anthropic.APIError as exc:
+            raise SkillError(f"Anthropic API error: {exc}") from exc
+        except anthropic.APIConnectionError as exc:
+            raise SkillError(f"Cannot reach Anthropic API: {exc}") from exc
+
+        # Extract text from the response
+        text_blocks = [
+            block.text for block in response.content if block.type == "text"
+        ]
+        raw = "\n".join(text_blocks)
+
+        # The prompt instructs the model to return JSON. Strip any
+        # markdown fencing the model may have added.
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```\w*\n?", "", raw)
+            raw = re.sub(r"\n?```$", "", raw.strip())
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SkillError(f"LLM output was not valid JSON: {exc}\nRaw output:\n{raw[:500]}")
+
+    # ── Local (deterministic) execution ──────────────────────────────────────
+
+    def _run_local(self, skill_name: str, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Run a skill as a local Python function (no LLM needed).
+
+        Used for deterministic skills like architecture_mapping where
+        the logic can be expressed as code rather than a prompt.
+        """
+
+        if skill_name == "architecture_mapping":
+            return self._run_architecture_mapping(inputs)
+
+        raise SkillError(f"No local handler for skill: {skill_name}")
+
+    def _run_architecture_mapping(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        """Apply architecture mapping rules deterministically."""
+
+        upstream_paths = inputs.get("upstream_paths", [])
+        change_type = inputs.get("change_type", "unknown")
+
+        # Load mapping rules
+        rules_path = self.skills_dir / "architecture_mapping" / "rules.yaml"
+        rules_data = yaml.safe_load(rules_path.read_text()) if rules_path.exists() else {}
+        rules = rules_data.get("rules", [])
+
+        # Load known mappings
+        mappings_path = self.knowledge_dir / "mappings.yaml"
+        mappings_data = yaml.safe_load(mappings_path.read_text()) if mappings_path.exists() else {}
+
+        downstream_targets = []
+        unmapped = []
+        new_mappings = []
+
+        module_maps = mappings_data.get("modules", {})
+        surface_maps = mappings_data.get("surfaces", {})
+
+        for path in upstream_paths:
+            # Check direct module mapping
+            if path in module_maps:
+                target = module_maps[path]
+                downstream_targets.append({
+                    "upstream": path,
+                    "downstream": target.get("downstream", path),
+                    "confidence": target.get("confidence", "medium"),
+                })
+            else:
+                # Try prefix matching
+                matched = False
+                for prefix, mapping in module_maps.items():
+                    if path.startswith(prefix):
+                        downstream = path.replace(prefix, mapping.get("downstream", prefix), 1)
+                        downstream_targets.append({
+                            "upstream": path,
+                            "downstream": downstream,
+                            "confidence": mapping.get("confidence", "medium"),
+                        })
+                        matched = True
+                        break
+
+                if not matched:
+                    unmapped.append(path)
+
+        return {
+            "downstream_targets": downstream_targets,
+            "unmapped": unmapped,
+            "new_mappings": new_mappings,
+        }
+
+    # ── Prompt rendering ─────────────────────────────────────────────────────
+
+    def _render_prompt(self, skill_dir: Path, inputs: dict[str, Any]) -> str:
+        """Load the prompt template and interpolate {{variable}} placeholders."""
+
+        prompt_path = skill_dir / "prompt.md"
+        if not prompt_path.exists():
+            raise SkillError(f"No prompt.md in {skill_dir}")
+
+        template = prompt_path.read_text()
+
+        # Interpolate {{key}} placeholders
+        def replace_match(match: re.Match) -> str:
+            key = match.group(1)
+            value = inputs.get(key, "")
+            if isinstance(value, (dict, list)):
+                return json.dumps(value, indent=2)
+            return str(value)
+
+        rendered = re.sub(r"\{\{(\w+)\}\}", replace_match, template)
+
+        # Also interpolate nested dot-notation like {{analysis.intent}}
+        def replace_dot_match(match: re.Match) -> str:
+            key_path = match.group(1)
+            parts = key_path.split(".")
+            value: Any = inputs
+            for part in parts:
+                if isinstance(value, dict):
+                    value = value.get(part, "")
+                else:
+                    value = ""
+                    break
+            if isinstance(value, (dict, list)):
+                return json.dumps(value, indent=2)
+            return str(value)
+
+        rendered = re.sub(r"\{\{([\w.]+)\}\}", replace_dot_match, rendered)
+
+        return rendered
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _load_skill_meta(skill_dir: Path) -> dict[str, Any]:
+        meta_path = skill_dir / "skill.yaml"
+        if not meta_path.exists():
+            return {}
+        with open(meta_path) as f:
+            return yaml.safe_load(f) or {}
