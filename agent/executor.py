@@ -224,7 +224,13 @@ class Executor:
                         break
 
                 if not matched:
-                    unmapped.append(path)
+                    # Default: passthrough — assume same path exists downstream
+                    # when no explicit mapping is configured
+                    downstream_targets.append({
+                        "upstream": path,
+                        "downstream": path,
+                        "confidence": "medium",
+                    })
 
         return {
             "downstream_targets": downstream_targets,
