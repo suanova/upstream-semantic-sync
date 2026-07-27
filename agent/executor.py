@@ -240,9 +240,9 @@ class Executor:
         return create_pr(
             repo_path=inputs.get("repo_path", ""),
             branch_name=inputs.get("branch_name", ""),
-            upstream_ref=inputs.get("upstream_ref", ""),
-            analysis=inputs.get("analysis", {}),
-            transformations=inputs.get("transformations", {}),
+            upstream_refs=inputs.get("upstream_refs", []),
+            analyses=inputs.get("analyses", []),
+            transformations=inputs.get("transformations", []),
             build_result=inputs.get("build_result", {}),
         )
 

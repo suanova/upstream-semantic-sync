@@ -3,6 +3,8 @@ upstream-semantic-sync — PR Creator
 
 Creates a pull request with the synced upstream changes using the GitHub
 API directly (no gh CLI needed). This is a local handler, not an LLM skill.
+
+Supports both single-commit and consolidated (multi-commit) PRs.
 """
 
 from __future__ import annotations
@@ -11,10 +13,7 @@ import json
 import logging
 import os
 import subprocess
-from pathlib import Path
 from typing import Any
-
-import yaml
 
 log = logging.getLogger("sync.create_pr")
 
@@ -22,15 +21,15 @@ log = logging.getLogger("sync.create_pr")
 def create_pr(
     repo_path: str,
     branch_name: str,
-    upstream_ref: str,
-    analysis: dict[str, Any],
-    transformations: dict[str, Any],
+    upstream_refs: list[str],
+    analyses: list[dict[str, Any]],
+    transformations: list[dict[str, Any]],
     build_result: dict[str, Any],
 ) -> dict[str, Any]:
     """Create a sync branch, commit transformed files, and open a PR.
 
-    Uses GITHUB_TOKEN for both git push (via x-access-token) and the
-    GitHub API for PR creation.
+    For a single commit: upstream_refs has 1 entry, analyses has 1 entry.
+    For a consolidated PR: upstream_refs has N entries, analyses has N entries.
     """
 
     github_token = os.environ.get("GITHUB_TOKEN", "")
@@ -43,19 +42,19 @@ def create_pr(
         return {"pr_url": "", "pr_number": 0, "status": "error: GITHUB_REPOSITORY not set"}
 
     # ── 1. Configure git identity ──────────────────────────────────────────
+    # Use --global since the checkout may be in a detached HEAD state
+    # where local config is read-only
     subprocess.run(
-        ["git", "config", "user.name", "github-actions[bot]"],
+        ["git", "config", "--global", "user.name", "github-actions[bot]"],
         cwd=repo_path, check=True, capture_output=True,
     )
     subprocess.run(
-        ["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"],
+        ["git", "config", "--global", "user.email", "github-actions[bot]@users.noreply.github.com"],
         cwd=repo_path, check=True, capture_output=True,
     )
 
     # ── 2. Configure authenticated push URL ────────────────────────────────
-    # Rewrite the origin URL to embed the token for push access
     if github_token and repo_slug:
-        # repo_slug is "owner/repo" from GITHUB_REPOSITORY
         authed_url = f"https://x-access-token:{github_token}@github.com/{repo_slug}.git"
         subprocess.run(
             ["git", "remote", "set-url", "origin", authed_url],
@@ -63,14 +62,21 @@ def create_pr(
         )
 
     # ── 3. Create the sync branch ──────────────────────────────────────────
-    # Determine the default branch (main or master)
+    # Determine the base branch. In Actions, HEAD is often detached,
+    # so fall back to GITHUB_BASE_REF or "main".
     result = subprocess.run(
         ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        cwd=repo_path, capture_output=True, text=True, check=True,
+        cwd=repo_path, capture_output=True, text=True,
     )
     base_branch = result.stdout.strip()
+    if not base_branch or base_branch == "HEAD":
+        # Fall back to env var or default
+        base_branch = os.environ.get("GITHUB_BASE_REF", "") or \
+                      os.environ.get("GITHUB_REF_NAME", "main")
+        # Strip refs/heads/ prefix if present
+        if base_branch.startswith("refs/heads/"):
+            base_branch = base_branch.removeprefix("refs/heads/")
 
-    # Fetch latest and create branch
     subprocess.run(
         ["git", "fetch", "origin", base_branch],
         cwd=repo_path, check=True, capture_output=True,
@@ -81,33 +87,44 @@ def create_pr(
     )
 
     # ── 4. Stage and commit transformed files ──────────────────────────────
-    t_files = transformations.get("transformations", [])
-    b_files = build_result.get("fixes_applied", [])
+    # Collect all files from all transformations and build fixes
+    all_files = []
+    for t_bundle in transformations:
+        for f in t_bundle.get("transformations", []):
+            path = f.get("path", "")
+            if path:
+                all_files.append(path)
 
-    # Add all transformed and build-fixed files
-    for f in t_files + b_files:
+    for f in build_result.get("fixes_applied", []):
         path = f.get("path", "")
         if path:
-            full = os.path.join(repo_path, path)
-            if os.path.exists(full):
-                subprocess.run(
-                    ["git", "add", path],
-                    cwd=repo_path, check=True, capture_output=True,
-                )
+            all_files.append(path)
 
-    # Commit
-    intent = analysis.get("intent", "upstream sync")
-    change_type = analysis.get("change_type", "unknown")
-    risk = analysis.get("risk", "unknown")
-    surfaces = ", ".join(analysis.get("surfaces", []))
+    # Deduplicate
+    for path in set(all_files):
+        full = os.path.join(repo_path, path)
+        if os.path.exists(full):
+            subprocess.run(
+                ["git", "add", path],
+                cwd=repo_path, check=True, capture_output=True,
+            )
 
-    commit_msg = (
-        f"sync(upstream): {intent}\n\n"
-        f"Upstream: {upstream_ref}\n"
-        f"Change-Type: {change_type}\n"
-        f"Risk: {risk}\n"
-        f"Surfaces: {surfaces}"
-    )
+    # Also stage the changelog if it exists
+    changelog_path = os.path.join(repo_path, "CHANGELOG.sync.md")
+    if os.path.exists(changelog_path):
+        subprocess.run(
+            ["git", "add", "CHANGELOG.sync.md"],
+            cwd=repo_path, check=True, capture_output=True,
+        )
+
+    # Build commit message
+    if len(upstream_refs) == 1:
+        title = f"sync(upstream): {analyses[0].get('intent', 'upstream sync')}"
+    else:
+        title = f"sync(upstream): {len(upstream_refs)} commits from upstream"
+
+    refs_str = "\n".join(f"  {ref}" for ref in upstream_refs)
+    commit_msg = f"{title}\n\nUpstream commits:\n{refs_str}"
 
     result = subprocess.run(
         ["git", "commit", "-m", commit_msg],
@@ -124,7 +141,7 @@ def create_pr(
     )
 
     # ── 6. Create the PR via GitHub API ───────────────────────────────────
-    pr_body = _build_pr_body(upstream_ref, analysis, transformations, build_result)
+    pr_body = _build_pr_body(upstream_refs, analyses, transformations, build_result)
 
     api_url = f"https://api.github.com/repos/{repo_slug}/pulls"
     headers = [
@@ -133,12 +150,13 @@ def create_pr(
         "-H", "X-GitHub-Api-Version: 2022-11-28",
     ]
 
+    has_conflicts = any(t.get("conflicts") for t in transformations)
     payload = json.dumps({
-        "title": f"sync(upstream): {intent}",
+        "title": title,
         "head": branch_name,
         "base": base_branch,
         "body": pr_body,
-        "draft": bool(transformations.get("conflicts")) or build_result.get("build_status") != "pass",
+        "draft": has_conflicts or build_result.get("build_status") == "fail",
     })
 
     result = subprocess.run(
@@ -152,11 +170,11 @@ def create_pr(
 
     # ── 7. Apply labels ───────────────────────────────────────────────────
     labels = ["upstream-sync"]
-    if change_type == "breaking":
+    if any(a.get("change_type") == "breaking" for a in analyses):
         labels.append("breaking-change")
-    if any(t.get("confidence") == "low" for t in t_files):
+    if any(t.get("confidence") == "low" for t in transformations for tr in t.get("transformations", [])):
         labels.append("needs-manual-review")
-    if transformations.get("conflicts"):
+    if has_conflicts:
         labels.append("has-conflicts")
     if build_result.get("build_status") == "fail":
         labels.append("build-failing")
@@ -175,45 +193,76 @@ def create_pr(
 # ── PR body builder ──────────────────────────────────────────────────────────
 
 def _build_pr_body(
-    upstream_ref: str,
-    analysis: dict[str, Any],
-    transformations: dict[str, Any],
+    upstream_refs: list[str],
+    analyses: list[dict[str, Any]],
+    transformations: list[dict[str, Any]],
     build_result: dict[str, Any],
 ) -> str:
-    """Build the markdown PR body."""
+    """Build the markdown PR body — supports single or consolidated PRs."""
 
-    lines = [
-        f"## Upstream Sync: {analysis.get('intent', '')}",
-        "",
-        "### Upstream Reference",
-        f"- **Commit:** `{upstream_ref}`",
-        f"- **Change type:** {analysis.get('change_type', 'unknown')}",
-        f"- **Risk level:** {analysis.get('risk', 'unknown')}",
-        "",
-        "### What Changed",
-        analysis.get("intent", ""),
-        "",
-        "### Affected Surfaces",
-    ]
+    lines = []
 
-    for surface in analysis.get("surfaces", []):
-        lines.append(f"- `{surface}`")
+    if len(upstream_refs) == 1:
+        lines.append(f"## Upstream Sync: {analyses[0].get('intent', '')}")
+        lines.append("")
+        lines.append("### Upstream Reference")
+        lines.append(f"- **Commit:** `{upstream_refs[0]}`")
+        lines.append(f"- **Change type:** {analyses[0].get('change_type', 'unknown')}")
+        lines.append(f"- **Risk level:** {analyses[0].get('risk', 'unknown')}")
+        lines.append("")
+        lines.append("### What Changed")
+        lines.append(analyses[0].get("intent", ""))
+        lines.append("")
+        lines.append("### Affected Surfaces")
+        for surface in analyses[0].get("surfaces", []):
+            lines.append(f"- `{surface}`")
+    else:
+        lines.append(f"## Upstream Sync: {len(upstream_refs)} Commits")
+        lines.append("")
+        lines.append("### Upstream Commits")
+        lines.append("| SHA | Intent | Type | Risk |")
+        lines.append("|-----|--------|------|------|")
+        for ref, analysis in zip(upstream_refs, analyses):
+            lines.append(
+                f"| `{ref[:12]}` | {analysis.get('intent', '')} | "
+                f"{analysis.get('change_type', '')} | {analysis.get('risk', '')} |"
+            )
 
-    lines.append("")
-    lines.append("### Transformations Applied")
-    lines.append("| Downstream File | Confidence | Notes |")
-    lines.append("|----------------|------------|-------|")
+        surfaces = set()
+        for a in analyses:
+            for s in a.get("surfaces", []):
+                surfaces.add(s)
+        if surfaces:
+            lines.append("")
+            lines.append("### Affected Surfaces")
+            for s in sorted(surfaces):
+                lines.append(f"- `{s}`")
 
-    for t in transformations.get("transformations", []):
-        lines.append(f"| `{t.get('path', '')}` | {t.get('confidence', '')} | {t.get('notes', '')} |")
+    # Transformations table
+    all_transforms = []
+    for t_bundle in transformations:
+        all_transforms.extend(t_bundle.get("transformations", []))
 
-    conflicts = transformations.get("conflicts", [])
-    if conflicts:
+    if all_transforms:
+        lines.append("")
+        lines.append("### Transformations Applied")
+        lines.append("| Downstream File | Confidence | Notes |")
+        lines.append("|----------------|------------|-------|")
+        for t in all_transforms:
+            lines.append(f"| `{t.get('path', '')}` | {t.get('confidence', '')} | {t.get('notes', '')} |")
+
+    # Conflicts
+    all_conflicts = []
+    for t_bundle in transformations:
+        all_conflicts.extend(t_bundle.get("conflicts", []))
+
+    if all_conflicts:
         lines.append("")
         lines.append("### ⚠️ Conflicts")
-        for c in conflicts:
+        for c in all_conflicts:
             lines.append(f"- **`{c.get('path', '')}`** ({c.get('region', '')}): {c.get('description', '')}")
 
+    # Build failures
     unresolved = build_result.get("unresolved", [])
     if unresolved:
         lines.append("")
@@ -221,7 +270,11 @@ def _build_pr_body(
         for u in unresolved:
             lines.append(f"- **`{u.get('path', '')}`**: {u.get('error', '')} — _Suggestion: {u.get('suggestion', '')}_")
 
-    candidates = transformations.get("new_mapping_candidates", [])
+    # New mapping candidates
+    candidates = []
+    for t_bundle in transformations:
+        candidates.extend(t_bundle.get("new_mapping_candidates", []))
+
     if candidates:
         lines.append("")
         lines.append("### 🔍 New Mapping Candidates")
