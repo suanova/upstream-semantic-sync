@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -32,7 +33,54 @@ SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 BUILTIN_KNOWLEDGE_DIR = Path(__file__).resolve().parent.parent / "knowledge"
 
 
-def resolve_knowledge_dir(repo_path: str) -> Path:
+def apply_transformations(repo_path: str, transformations: list[dict[str, Any]]) -> list[str]:
+    """Apply transformation diffs to the downstream repo on disk.
+
+    Each transformation may contain:
+    - 'diff': a unified diff to apply via git apply
+    - 'path': a file path (for git add tracking)
+    - 'content': full file content to write (fallback if diff fails)
+
+    Returns list of paths that were modified.
+    """
+    import subprocess
+
+    modified = []
+    for t in transformations:
+        path = t.get("path", "")
+        diff = t.get("diff", "")
+        content = t.get("content", "")
+
+        if diff:
+            # Apply the unified diff
+            r = subprocess.run(
+                ["git", "apply", "--allow-empty"],
+                input=diff, cwd=repo_path,
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0 and path:
+                modified.append(path)
+                log.info("Applied diff to %s", path)
+            else:
+                log.warning("git apply failed for %s: %s", path, r.stderr.strip())
+                # Fallback: if content is provided, write it directly
+                if content and path:
+                    full_path = os.path.join(repo_path, path)
+                    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                    with open(full_path, "w") as f:
+                        f.write(content)
+                    modified.append(path)
+                    log.info("Wrote full content to %s", path)
+        elif content and path:
+            # No diff, but full content provided — write directly
+            full_path = os.path.join(repo_path, path)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w") as f:
+                f.write(content)
+            modified.append(path)
+            log.info("Wrote content to %s", path)
+
+    return modified
     """Pick the knowledge directory: repo's knowledge/ if it exists, else builtin."""
     repo_knowledge = Path(repo_path) / "knowledge"
     if repo_knowledge.exists():
@@ -372,6 +420,10 @@ def run_sync_batch(
 
             t_list = transform_out.get("transformations", [])
             c_list = transform_out.get("conflicts", [])
+
+            # Apply the transformations to disk
+            if t_list:
+                apply_transformations(downstream_repo, t_list)
 
             all_transformations.extend(t_list)
             all_conflicts.extend(c_list)
