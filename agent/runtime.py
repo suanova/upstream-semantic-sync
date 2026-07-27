@@ -27,7 +27,20 @@ from agent.executor import Executor
 log = logging.getLogger("sync.runtime")
 
 SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
-KNOWLEDGE_DIR = Path(__file__).resolve().parent.parent / "knowledge"
+# Knowledge dir: prefer the downstream repo's knowledge/ (mounted at
+# /github/workspace/knowledge) so sync_state persists across runs.
+# Fall back to the image's built-in knowledge/ for prompts/mappings.
+BUILTIN_KNOWLEDGE_DIR = Path(__file__).resolve().parent.parent / "knowledge"
+
+
+def resolve_knowledge_dir(repo_path: str) -> Path:
+    """Pick the knowledge directory: repo's knowledge/ if it exists, else builtin."""
+    repo_knowledge = Path(repo_path) / "knowledge"
+    if repo_knowledge.exists():
+        log.info("Using knowledge dir from downstream repo: %s", repo_knowledge)
+        return repo_knowledge
+    log.info("Using builtin knowledge dir: %s", BUILTIN_KNOWLEDGE_DIR)
+    return BUILTIN_KNOWLEDGE_DIR
 
 
 # ── Pipeline result ──────────────────────────────────────────────────────────
@@ -141,8 +154,9 @@ def run_sync(
     """Run the full sync pipeline for a single upstream commit."""
 
     result = SyncResult(commit_sha=commit_sha)
-    planner = Planner(knowledge_dir=KNOWLEDGE_DIR)
-    executor = Executor(skills_dir=SKILLS_DIR, knowledge_dir=KNOWLEDGE_DIR)
+    knowledge_dir = resolve_knowledge_dir(downstream_repo)
+    planner = Planner(knowledge_dir=knowledge_dir)
+    executor = Executor(skills_dir=SKILLS_DIR, knowledge_dir=knowledge_dir)
 
     try:
         # 1. Analyze
@@ -204,7 +218,8 @@ def run_sync_range(
 ) -> list[SyncResult]:
     """Run the sync pipeline for a range of upstream commits."""
 
-    planner = Planner(knowledge_dir=KNOWLEDGE_DIR)
+    knowledge_dir = resolve_knowledge_dir(downstream_repo)
+    planner = Planner(knowledge_dir=knowledge_dir)
     commits = planner.order_commits(upstream_repo, sha_range, branch)
 
     results = []
@@ -234,7 +249,8 @@ def run_sync_since_last(
     If no last SHA is recorded, logs a warning and returns empty.
     Use --range or --commit for the initial sync.
     """
-    planner = Planner(knowledge_dir=KNOWLEDGE_DIR)
+    knowledge_dir = resolve_knowledge_dir(downstream_repo)
+    planner = Planner(knowledge_dir=knowledge_dir)
 
     last_sha = planner.get_last_synced_sha(upstream_repo, branch)
     if not last_sha:
@@ -315,7 +331,8 @@ def main() -> None:
 
         # For one-off --commit, also update the last-synced pointer
         if not args.dry_run and result.ok:
-            planner = Planner(knowledge_dir=KNOWLEDGE_DIR)
+            knowledge_dir = resolve_knowledge_dir(args.repo)
+            planner = Planner(knowledge_dir=knowledge_dir)
             planner.set_last_synced_sha(args.upstream, args.branch, args.commit)
     else:
         results = run_sync_range(args.repo, args.upstream, args.range_, args.branch, args.dry_run)
