@@ -116,17 +116,54 @@ class Executor:
         ]
         raw = "\n".join(text_blocks)
 
-        # The prompt instructs the model to return JSON. Strip any
-        # markdown fencing the model may have added.
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = re.sub(r"^```\w*\n?", "", raw)
-            raw = re.sub(r"\n?```$", "", raw.strip())
+        # Parse JSON from the LLM output, which may contain markdown
+        # fencing or extra text after the JSON object.
+        parsed = self._extract_json(raw)
+        if parsed is not None:
+            return parsed
 
+        raise SkillError(f"LLM output was not valid JSON.\nRaw output:\n{raw[:500]}")
+
+    @staticmethod
+    def _extract_json(text: str) -> dict[str, Any] | None:
+        """Extract the first JSON object from text that may have extra content.
+
+        Handles:
+        - Raw JSON
+        - JSON wrapped in ```json ... ```
+        - JSON followed by explanatory text
+        """
+        text = text.strip()
+
+        # Try 1: strip markdown fencing
+        if text.startswith("```"):
+            inner = re.sub(r"^```\w*\n?", "", text)
+            inner = re.sub(r"\n?```$", "", inner.strip())
+            try:
+                return json.loads(inner)
+            except json.JSONDecodeError:
+                pass
+
+        # Try 2: find the first { ... } using brace counting
+        start = text.find("{")
+        if start != -1:
+            depth = 0
+            for i in range(start, len(text)):
+                if text[i] == "{":
+                    depth += 1
+                elif text[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            return json.loads(text[start : i + 1])
+                        except json.JSONDecodeError:
+                            break
+
+        # Try 3: the whole thing
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise SkillError(f"LLM output was not valid JSON: {exc}\nRaw output:\n{raw[:500]}")
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return None
 
     # ── Local (deterministic) execution ──────────────────────────────────────
 

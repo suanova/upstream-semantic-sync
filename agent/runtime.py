@@ -61,22 +61,79 @@ class SyncResult:
     pr_number: int = 0
     errors: list[str] = field(default_factory=list)
 
+    skipped: bool = False
+
     @property
     def ok(self) -> bool:
-        return len(self.errors) == 0 and self.build_status == "pass"
+        """True if no errors and no build failures.
+
+        - Skipped commits (planner policy) count as ok.
+        - build_status 'unknown' (dry run or not attempted) counts as ok.
+        """
+        if self.skipped:
+            return True
+        if self.errors:
+            return False
+        if self.build_status == "fail":
+            return False
+        return True
 
 
 # ── Pipeline stages ──────────────────────────────────────────────────────────
 
-def stage_analyze(executor: Executor, repo_url: str, commit_sha: str, branch: str) -> dict:
+def stage_fetch_commit(repo_url: str, commit_sha: str, branch: str, knowledge_dir: Path) -> str:
+    """Fetch the commit diff from upstream so the LLM can analyze it.
+
+    Returns a formatted string with the commit message, metadata, and diff.
+    """
+    import subprocess
+
+    # Use the upstream cache dir from planner
+    upstream_dir = knowledge_dir / ".upstream-cache"
+    upstream_dir.mkdir(parents=True, exist_ok=True)
+
+    repo_name = repo_url.rstrip("/").removesuffix(".git").rsplit("/", 1)[-1]
+    clone_dir = upstream_dir / repo_name
+
+    if clone_dir.exists():
+        log.info("Fetching upstream %s", repo_url)
+        subprocess.run(
+            ["git", "fetch", "origin", branch],
+            cwd=str(clone_dir), capture_output=True, text=True, check=True,
+        )
+    else:
+        log.info("Cloning upstream %s", repo_url)
+        subprocess.run(
+            ["git", "clone", "--filter=blob:none", repo_url, str(clone_dir)],
+            capture_output=True, text=True, check=True,
+        )
+
+    # Get the commit message + metadata
+    result = subprocess.run(
+        ["git", "show", "--no-patch", "--format=commit %H%nAuthor: %an <%ae>%nDate:   %ad%n%n    %s%n%n%b", commit_sha],
+        cwd=str(clone_dir), capture_output=True, text=True, check=True,
+    )
+    header = result.stdout.strip()
+
+    # Get the diff (stat + patch), truncated to 8KB to stay within context
+    result = subprocess.run(
+        ["git", "diff-tree", "--patch", "--stat", commit_sha],
+        cwd=str(clone_dir), capture_output=True, text=True, check=True,
+    )
+    diff = result.stdout
+    if len(diff) > 8192:
+        diff = diff[:8192] + "\n... (truncated)"
+
+    return f"## Commit metadata\n\n{header}\n\n## Diff\n\n```diff\n{diff}\n```"
+
+
+def stage_analyze(executor: Executor, repo_url: str, commit_sha: str, branch: str, commit_data: str) -> dict:
     """Stage 1: Analyze the upstream commit."""
     log.info("Analyzing upstream commit %s", commit_sha)
     return executor.run_skill(
         "analyze_commit",
         inputs={
-            "repo_url": repo_url,
-            "commit_sha": commit_sha,
-            "branch": branch,
+            "commit_data": commit_data,
         },
     )
 
@@ -159,8 +216,12 @@ def run_sync(
     executor = Executor(skills_dir=SKILLS_DIR, knowledge_dir=knowledge_dir)
 
     try:
+        # 0. Fetch the commit diff from upstream
+        commit_data = stage_fetch_commit(upstream_repo, commit_sha, branch, knowledge_dir)
+
         # 1. Analyze
-        analysis = stage_analyze(executor, upstream_repo, commit_sha, branch)
+        analysis = stage_analyze(executor, upstream_repo, commit_sha, branch, commit_data)
+        analysis["commit_sha"] = commit_sha
         result.intent = analysis.get("intent", "")
         result.change_type = analysis.get("change_type", "")
         result.risk = analysis.get("risk", "")
@@ -168,7 +229,8 @@ def run_sync(
         # Check if planner says we should skip
         if not planner.should_sync(analysis):
             log.info("Planner recommends skipping this commit: %s", analysis.get("intent"))
-            result.errors.append("Skipped by planner policy")
+            result.skipped = True
+            result.intent = analysis.get("intent", "")
             return result
 
         # 2. Map
@@ -347,6 +409,7 @@ def main() -> None:
                 "build_status": r.build_status,
                 "pr_url": r.pr_url,
                 "ok": r.ok,
+                "skipped": r.skipped,
                 "errors": r.errors,
             }
             for r in results
@@ -356,12 +419,23 @@ def main() -> None:
         if not results:
             print("Nothing to sync.")
         for r in results:
-            status = "✓" if r.ok else "✗"
+            if r.skipped:
+                status = "⊘"
+            elif r.ok:
+                status = "✓"
+            else:
+                status = "✗"
             print(f"{status} {r.commit_sha[:12]}  {r.intent}")
             if r.pr_url:
                 print(f"  → {r.pr_url}")
             for err in r.errors:
                 print(f"  ⚠ {err}")
+
+    # Exit with non-zero code if any sync failed, so the Action marks it as failed
+    any_failed = any(not r.ok for r in results)
+    if any_failed:
+        log.error("One or more commits failed to sync")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
