@@ -1,0 +1,30 @@
+name: resolve_conflict
+version: "1.0"
+description: |
+  Second-pass LLM call to resolve conflicts that the initial transform
+  stage could not handle. Receives conflict descriptions, downstream file
+  contents, and the upstream analysis, and produces transformations.
+inputs:
+  - name: conflicts
+    type: list[object]
+    required: true
+    description: Conflicts from the transform stage
+  - name: analysis
+    type: object
+    required: true
+    description: Upstream commit analysis
+  - name: mappings
+    type: object
+    required: true
+    description: Architecture mappings
+  - name: downstream_files
+    type: object
+    required: false
+    description: Current downstream file contents keyed by path
+outputs:
+  - name: transformations
+    type: list[object]
+    description: Resolved transformations with full file content
+  - name: conflicts
+    type: list[object]
+    description: Conflicts that truly cannot be resolved (SYNC markers only)

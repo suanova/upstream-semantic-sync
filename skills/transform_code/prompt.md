@@ -8,6 +8,8 @@ architecture, conventions, and naming patterns.
 - **Upstream commit analysis:** `{{analysis}}`
 - **Architecture mappings:** `{{mappings}}`
 - **Downstream targets:** `{{downstream_targets}}`
+- **Current downstream file contents:** `{{downstream_files}}`
+- **Downstream conventions:** `{{conventions}}`
 
 ## Principles
 
@@ -20,32 +22,44 @@ architecture, conventions, and naming patterns.
    upstream.
 
 3. **Apply mappings, don't copy.** Use the architecture mappings to find the
-   correct downstream location and form. If a mapping is missing, flag it rather
-   than guessing.
+   correct downstream location and form. If a mapping is missing, make your best
+   guess and note it.
 
 4. **Minimize blast radius.** Change only what the upstream change requires.
    Do not refactor surrounding code or "improve" unrelated patterns.
 
-5. **Preserve SYNC markers.** If downstream code contains `SYNC:FORK_DIVERGED`
-   or `SYNC:MANUAL` markers, do not overwrite those regions. Surface them as
-   conflicts.
+5. **Adapt, don't copy.** When downstream has diverged from upstream, adapt the
+   upstream *intent* to fit the downstream's current code structure. Do not
+   blindly copy upstream's approach if it doesn't match downstream conventions.
+
+6. **Preserve SYNC markers.** If downstream code contains `SYNC:FORK_DIVERGED`
+   or `SYNC:MANUAL` markers, do not overwrite those regions. You may still
+   transform other parts of the same file.
+
+7. **Follow downstream conventions.** If the Downstream conventions context is
+   provided, use it to understand how the fork diverges from upstream. It
+   explains renamed symbols, structural differences, and intentional
+   divergence. Use this information to adapt the upstream change rather than
+   flagging it as a conflict.
 
 ## Steps
 
-1. For each downstream target in `{{downstream_targets}}`:
-   a. Read the current downstream file.
+1. For each downstream target that has file contents provided:
+   a. Read the current downstream file contents provided in the context.
    b. Identify the regions that correspond to the upstream change.
-   c. Apply the mapped transformation.
-   d. Verify the transformation compiles (or is syntactically valid).
+   c. Produce the full modified file content with the transformation applied.
+   d. Set `confidence` to reflect how certain you are:
+      - `high` — straightforward mapping, identical structure
+      - `medium` — mapping exists but adaptation needed
+      - `low` — uncertain, making assumptions — explain them in `notes`
 
-2. For any `unmapped` paths from the architecture mapping:
-   - If the path is internal-only to upstream, skip with a note.
-   - If the path likely has a downstream equivalent we haven't discovered,
-     emit a `new_mapping_candidate` for human review.
+2. For targets without file contents (file doesn't exist downstream yet):
+   - Create the file with the adapted upstream content.
+   - Set `confidence` to `low` and note that the file is new.
 
-3. Check for merge conflicts with recent downstream changes:
-   - Compare against the target branch HEAD.
-   - If conflicts exist, generate a conflict description, not a resolution.
+3. For SYNC:FORK_DIVERGED or SYNC:MANUAL markers:
+   - You may still transform other parts of the file.
+   - In `notes`, mention which marked regions were left untouched.
 
 ## Output Format
 
@@ -56,7 +70,7 @@ Return a JSON object:
   "transformations": [
     {
       "path": "downstream/path/to/file",
-      "diff": "unified diff of the transformation",
+      "content": "the complete modified file content after applying the transformation",
       "confidence": "<high|medium|low>",
       "notes": "any caveats or assumptions"
     }
@@ -68,26 +82,24 @@ Return a JSON object:
       "region": "line range or symbol name"
     }
   ],
-  "new_mapping_candidates": [
-    {
-      "upstream": "upstream/path:Symbol",
-      "downstream_guess": "downstream/path:Symbol",
-      "reason": "why this mapping might work"
-    }
-  ],
-  "skipped": [
-    {
-      "upstream_path": "upstream/internal/path",
-      "reason": "internal to upstream, no downstream equivalent"
-    }
-  ]
+  "new_mapping_candidates": [],
+  "skipped": []
 }
 ```
 
-## Guardrails
+## CRITICAL RULES
 
-- Never delete downstream code that isn't being replaced.
-- Never change public downstream API signatures unless the upstream change is
-  `breaking` and was approved.
+- **ALWAYS produce a transformation.** Even if you are uncertain about how the
+  upstream change maps to downstream, produce your best attempt and set
+  `confidence` to `low`. Explain your assumptions in `notes`.
+- **Only use `conflicts` as a last resort.** The ONLY valid reason to put a
+  target in `conflicts` is if a `SYNC:FORK_DIVERGED` or `SYNC:MANUAL` marker
+  covers the *entire* region that needs to change, leaving you no room to apply
+  the transformation without violating the marker.
+- Each transformation MUST include the full `content` field with the complete
+  modified file. Do NOT use diffs — provide the entire file content.
+- Do NOT copy upstream code verbatim. Adapt it to match downstream conventions.
+- If the downstream file already has the upstream change applied, still include
+  it as a transformation with `confidence: high` and a note like "already applied".
 - If confidence is `low`, include the raw upstream diff in `notes` so a human
-  can do the transformation manually.
+  can verify the transformation manually.
