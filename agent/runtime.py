@@ -446,6 +446,7 @@ def main() -> None:
         help="Sync all upstream commits since the last synced SHA (for scheduled runs)",
     )
     parser.add_argument("--branch", default="main", help="Upstream branch (default: main)")
+    parser.add_argument("--limit", type=int, default=1, help="Max commits to adopt per run (0 = unlimited)")
     parser.add_argument("--dry-run", action="store_true", help="Stop before creating PR")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -476,6 +477,12 @@ def main() -> None:
         if not commits:
             print("Upstream is up to date.")
             sys.exit(0)
+
+        # Apply limit
+        total = len(commits)
+        if args.limit > 0 and total > args.limit:
+            log.info("Limiting to %d of %d new commits (use --limit to change)", args.limit, total)
+            commits = commits[:args.limit]
 
         batch_result = run_sync_batch(args.repo, args.upstream, commits, args.branch, args.dry_run)
 
@@ -548,6 +555,12 @@ def main() -> None:
         knowledge_dir = resolve_knowledge_dir(args.repo)
         planner = Planner(knowledge_dir=knowledge_dir)
         commits = planner.order_commits(args.upstream, args.range_, args.branch)
+
+        # Apply limit
+        total = len(commits)
+        if args.limit > 0 and total > args.limit:
+            log.info("Limiting to %d of %d commits", args.limit, total)
+            commits = commits[:args.limit]
 
         batch_result = run_sync_batch(args.repo, args.upstream, commits, args.branch, args.dry_run)
 

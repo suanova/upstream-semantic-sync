@@ -72,6 +72,10 @@ inputs:
     description: 'Commit range to sync (sha1..sha2, overrides since_last)'
     required: false
     default: ''
+  limit:
+    description: 'Max commits to adopt per run (0 = unlimited). Use to limit blast radius on large upstream batches.'
+    required: false
+    default: '1'
   max_risk:
     description: 'Maximum risk level to auto-sync (low, medium, high)'
     required: false
@@ -113,6 +117,8 @@ runs:
     - ${{ inputs.commit }}
     - ${{ inputs.range != '' && '--range' || '' }}
     - ${{ inputs.range }}
+    - ${{ inputs.limit != '1' && '--limit' || '' }}
+    - ${{ inputs.limit != '1' && inputs.limit || '' }}
     - ${{ inputs.dry_run == 'true' && '--dry-run' || '' }}
     - '--json'
 

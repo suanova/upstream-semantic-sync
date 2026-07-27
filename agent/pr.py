@@ -18,6 +18,18 @@ from typing import Any
 log = logging.getLogger("sync.create_pr")
 
 
+def _git(repo_path: str, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    """Run a git command with logging. Returns CompletedProcess."""
+    result = subprocess.run(
+        ["git"] + list(args),
+        cwd=repo_path, capture_output=True, text=True,
+    )
+    if result.returncode != 0 and check:
+        log.error("git %s failed (rc=%d): %s", " ".join(args), result.returncode, result.stderr.strip())
+        raise subprocess.CalledProcessError(result.returncode, ["git"] + list(args), result.stdout, result.stderr)
+    return result
+
+
 def create_pr(
     repo_path: str,
     branch_name: str,
@@ -26,14 +38,9 @@ def create_pr(
     transformations: list[dict[str, Any]],
     build_result: dict[str, Any],
 ) -> dict[str, Any]:
-    """Create a sync branch, commit transformed files, and open a PR.
-
-    For a single commit: upstream_refs has 1 entry, analyses has 1 entry.
-    For a consolidated PR: upstream_refs has N entries, analyses has N entries.
-    """
+    """Create a sync branch, commit transformed files, and open a PR."""
 
     github_token = os.environ.get("GITHUB_TOKEN", "")
-    github_actor = os.environ.get("GITHUB_ACTOR", "github-actions[bot]")
     repo_slug = os.environ.get("GITHUB_REPOSITORY", "")
 
     if not github_token:
@@ -42,52 +49,34 @@ def create_pr(
         return {"pr_url": "", "pr_number": 0, "status": "error: GITHUB_REPOSITORY not set"}
 
     # ── 1. Configure git identity ──────────────────────────────────────────
-    # Use --global since the checkout may be in a detached HEAD state
-    # where local config is read-only
-    subprocess.run(
-        ["git", "config", "--global", "user.name", "github-actions[bot]"],
-        cwd=repo_path, check=True, capture_output=True,
-    )
-    subprocess.run(
-        ["git", "config", "--global", "user.email", "github-actions[bot]@users.noreply.github.com"],
-        cwd=repo_path, check=True, capture_output=True,
-    )
+    _git(repo_path, "config", "--global", "user.name", "github-actions[bot]")
+    _git(repo_path, "config", "--global", "user.email", "github-actions[bot]@users.noreply.github.com")
 
     # ── 2. Configure authenticated push URL ────────────────────────────────
-    if github_token and repo_slug:
-        authed_url = f"https://x-access-token:{github_token}@github.com/{repo_slug}.git"
-        subprocess.run(
-            ["git", "remote", "set-url", "origin", authed_url],
-            cwd=repo_path, check=True, capture_output=True,
-        )
+    authed_url = f"https://x-access-token:{github_token}@github.com/{repo_slug}.git"
+    # Try set-url; if that fails, add the remote
+    r = _git(repo_path, "remote", "set-url", "origin", authed_url, check=False)
+    if r.returncode != 0:
+        log.warning("git remote set-url failed — trying remote add")
+        _git(repo_path, "remote", "add", "origin", authed_url, check=False)
 
-    # ── 3. Create the sync branch ──────────────────────────────────────────
-    # Determine the base branch. In Actions, HEAD is often detached,
-    # so fall back to GITHUB_BASE_REF or "main".
-    result = subprocess.run(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-        cwd=repo_path, capture_output=True, text=True,
-    )
-    base_branch = result.stdout.strip()
+    # ── 3. Determine base branch ──────────────────────────────────────────
+    r = _git(repo_path, "rev-parse", "--abbrev-ref", "HEAD", check=False)
+    base_branch = r.stdout.strip()
     if not base_branch or base_branch == "HEAD":
-        # Fall back to env var or default
-        base_branch = os.environ.get("GITHUB_BASE_REF", "") or \
-                      os.environ.get("GITHUB_REF_NAME", "main")
-        # Strip refs/heads/ prefix if present
+        base_branch = os.environ.get("GITHUB_REF_NAME", "main")
         if base_branch.startswith("refs/heads/"):
             base_branch = base_branch.removeprefix("refs/heads/")
+    log.info("Base branch: %s", base_branch)
 
-    subprocess.run(
-        ["git", "fetch", "origin", base_branch],
-        cwd=repo_path, check=True, capture_output=True,
-    )
-    subprocess.run(
-        ["git", "checkout", "-b", branch_name, f"origin/{base_branch}"],
-        cwd=repo_path, check=True, capture_output=True,
-    )
+    # ── 4. Fetch and create sync branch ───────────────────────────────────
+    _git(repo_path, "fetch", "origin", base_branch)
 
-    # ── 4. Stage and commit transformed files ──────────────────────────────
-    # Collect all files from all transformations and build fixes
+    # Delete the branch if it already exists from a previous failed run
+    _git(repo_path, "branch", "-D", branch_name, check=False)
+    _git(repo_path, "checkout", "-b", branch_name, f"origin/{base_branch}")
+
+    # ── 5. Stage and commit transformed files ──────────────────────────────
     all_files = []
     for t_bundle in transformations:
         for f in t_bundle.get("transformations", []):
@@ -100,22 +89,16 @@ def create_pr(
         if path:
             all_files.append(path)
 
-    # Deduplicate
+    # Deduplicate and stage
     for path in set(all_files):
         full = os.path.join(repo_path, path)
         if os.path.exists(full):
-            subprocess.run(
-                ["git", "add", path],
-                cwd=repo_path, check=True, capture_output=True,
-            )
+            _git(repo_path, "add", path)
 
     # Also stage the changelog if it exists
     changelog_path = os.path.join(repo_path, "CHANGELOG.sync.md")
     if os.path.exists(changelog_path):
-        subprocess.run(
-            ["git", "add", "CHANGELOG.sync.md"],
-            cwd=repo_path, check=True, capture_output=True,
-        )
+        _git(repo_path, "add", "CHANGELOG.sync.md")
 
     # Build commit message
     if len(upstream_refs) == 1:
@@ -126,21 +109,16 @@ def create_pr(
     refs_str = "\n".join(f"  {ref}" for ref in upstream_refs)
     commit_msg = f"{title}\n\nUpstream commits:\n{refs_str}"
 
-    result = subprocess.run(
-        ["git", "commit", "-m", commit_msg],
-        cwd=repo_path, capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        log.warning("Nothing to commit — no changes detected")
+    r = _git(repo_path, "commit", "-m", commit_msg, check=False)
+    if r.returncode != 0:
+        log.warning("Nothing to commit — no changes detected: %s", r.stderr.strip())
         return {"pr_url": "", "pr_number": 0, "status": "no_changes"}
 
-    # ── 5. Push the branch ─────────────────────────────────────────────────
-    subprocess.run(
-        ["git", "push", "origin", branch_name],
-        cwd=repo_path, check=True, capture_output=True,
-    )
+    # ── 6. Push the branch ─────────────────────────────────────────────────
+    # Use --force-with-lease to overwrite if branch existed from a prior run
+    _git(repo_path, "push", "--force-with-lease", "origin", branch_name)
 
-    # ── 6. Create the PR via GitHub API ───────────────────────────────────
+    # ── 7. Create the PR via GitHub API ───────────────────────────────────
     pr_body = _build_pr_body(upstream_refs, analyses, transformations, build_result)
 
     api_url = f"https://api.github.com/repos/{repo_slug}/pulls"
@@ -168,7 +146,7 @@ def create_pr(
     pr_url = response.get("html_url", "")
     pr_number = response.get("number", 0)
 
-    # ── 7. Apply labels ───────────────────────────────────────────────────
+    # ── 8. Apply labels ───────────────────────────────────────────────────
     labels = ["upstream-sync"]
     if any(a.get("change_type") == "breaking" for a in analyses):
         labels.append("breaking-change")
