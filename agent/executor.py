@@ -66,9 +66,6 @@ class Executor:
         # Load skill metadata
         meta = self._load_skill_meta(skill_dir)
 
-        # Load and render the prompt template
-        prompt = self._render_prompt(skill_dir, inputs)
-
         log.info(
             "Running skill %s (version %s)",
             meta.get("name", skill_name),
@@ -78,14 +75,12 @@ class Executor:
         # Determine execution mode
         handler = meta.get("handler", "llm")
 
-        if handler == "llm":
-            output = self._run_llm(prompt, meta)
-        elif handler == "local":
-            output = self._run_local(skill_name, inputs)
-        else:
-            raise SkillError(f"Unknown handler type: {handler}")
+        if handler == "local":
+            return self._run_local(skill_name, inputs)
 
-        return output
+        # LLM handler — need a prompt template
+        prompt = self._render_prompt(skill_dir, inputs)
+        return self._run_llm(prompt, meta)
 
     # ── LLM execution ───────────────────────────────────────────────────────
 
