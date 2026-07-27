@@ -458,6 +458,19 @@ def main() -> None:
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
+    # In Docker-based GitHub Actions, the container runs as root but the
+    # workspace is owned by the runner user. Git refuses to operate on
+    # repos with mismatched ownership unless we mark them as safe.
+    import subprocess
+    subprocess.run(
+        ["git", "config", "--global", "--add", "safe.directory", args.repo],
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "config", "--global", "--add", "safe.directory", "*"],
+        capture_output=True, text=True,
+    )
+
     if not args.commit and not args.range_ and not args.since_last:
         parser.error("Must specify --commit, --range, or --since-last")
 

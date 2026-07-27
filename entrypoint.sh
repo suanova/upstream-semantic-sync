@@ -6,6 +6,12 @@
 
 set -e
 
+# Fix "dubious ownership" error: Docker container runs as root but
+# /github/workspace is owned by the runner user. Git 2.35+ refuses
+# to operate on repos with mismatched ownership.
+git config --global --add safe.directory /github/workspace
+git config --global --add safe.directory '*'
+
 # Build the argument list, skipping empty strings
 ARGS=()
 for arg in "$@"; do

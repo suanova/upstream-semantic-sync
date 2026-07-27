@@ -48,6 +48,9 @@ def create_pr(
     if not repo_slug:
         return {"pr_url": "", "pr_number": 0, "status": "error: GITHUB_REPOSITORY not set"}
 
+    # ── 0. Mark repo as safe directory (Docker runs as root, workspace is runner-owned) ──
+    _git(repo_path, "config", "--global", "--add", "safe.directory", repo_path)
+
     # ── 1. Configure git identity ──────────────────────────────────────────
     _git(repo_path, "config", "--global", "user.name", "github-actions[bot]")
     _git(repo_path, "config", "--global", "user.email", "github-actions[bot]@users.noreply.github.com")
