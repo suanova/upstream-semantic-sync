@@ -1,0 +1,37 @@
+name: transform_code
+version: "1.0"
+description: |
+  Transform upstream code changes to fit the downstream codebase's architecture,
+  conventions, and naming patterns. Produces complete modified file content.
+inputs:
+  - name: analysis
+    type: object
+    required: true
+    description: Upstream commit analysis
+  - name: mappings
+    type: object
+    required: true
+    description: Architecture mappings
+  - name: downstream_targets
+    type: list[object]
+    required: true
+    description: Downstream file targets
+  - name: downstream_files
+    type: object
+    required: false
+    description: Current downstream file contents keyed by path
+  - name: conventions
+    type: string
+    required: false
+    description: Downstream conventions from knowledge/conventions.md
+outputs:
+  - name: transformations
+    type: list[object]
+    description: Transformed files with full content
+  - name: conflicts
+    type: list[object]
+    description: Targets that could not be transformed
+# Heavier skill — needs more tokens and time because it receives
+# full file contents and must produce complete modified files.
+max_tokens: 16384
+timeout: 300

@@ -87,23 +87,63 @@ class Executor:
     def _run_llm(self, prompt: str, meta: dict[str, Any]) -> dict[str, Any]:
         """Invoke Claude via the Anthropic Python SDK and parse structured JSON output."""
 
+        import time
+
         model = meta.get("model", self.model)
         max_tokens = meta.get("max_tokens", 8192)
-        timeout = meta.get("timeout", 120)
+        timeout = meta.get("timeout", 300)
+        max_retries = meta.get("max_retries", 3)
 
-        try:
-            response = self.client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                timeout=timeout,
-                messages=[
-                    {"role": "user", "content": prompt},
-                ],
-            )
-        except anthropic.APIError as exc:
-            raise SkillError(f"Anthropic API error: {exc}") from exc
-        except anthropic.APIConnectionError as exc:
-            raise SkillError(f"Cannot reach Anthropic API: {exc}") from exc
+        last_exc = None
+        for attempt in range(max_retries):
+            try:
+                response = self.client.messages.create(
+                    model=model,
+                    max_tokens=max_tokens,
+                    timeout=timeout,
+                    messages=[
+                        {"role": "user", "content": prompt},
+                    ],
+                )
+                break  # success
+            except anthropic.InternalServerError as exc:
+                # 500/502/503/504 — server-side transient errors, worth retrying
+                last_exc = exc
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt  # 1s, 2s, 4s
+                    log.warning(
+                        "Server error (attempt %d/%d), retrying in %ds: %s",
+                        attempt + 1, max_retries, wait, exc,
+                    )
+                    time.sleep(wait)
+                else:
+                    raise SkillError(f"Anthropic API error after {max_retries} retries: {exc}") from exc
+            except anthropic.RateLimitError as exc:
+                # 429 — rate limited, back off longer
+                last_exc = exc
+                if attempt < max_retries - 1:
+                    wait = 4 * (2 ** attempt)  # 4s, 8s, 16s
+                    log.warning(
+                        "Rate limited (attempt %d/%d), retrying in %ds",
+                        attempt + 1, max_retries, wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    raise SkillError(f"Rate limited after {max_retries} retries: {exc}") from exc
+            except anthropic.APIError as exc:
+                # Other API errors (400, 401, 403, etc.) — not retryable
+                raise SkillError(f"Anthropic API error: {exc}") from exc
+            except anthropic.APIConnectionError as exc:
+                last_exc = exc
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    log.warning(
+                        "Connection error (attempt %d/%d), retrying in %ds: %s",
+                        attempt + 1, max_retries, wait, exc,
+                    )
+                    time.sleep(wait)
+                else:
+                    raise SkillError(f"Cannot reach Anthropic API after {max_retries} retries: {exc}") from exc
 
         # Extract text from the response
         text_blocks = [

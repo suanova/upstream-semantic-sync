@@ -514,6 +514,9 @@ def run_sync_batch(
                 result.skipped_commits.append(sha)
                 continue
 
+            # Track this commit's analysis even if transform fails later
+            result.analyses.append(analysis)
+
             # Map + transform
             mappings = stage_map(executor, analysis)
             transform_out = stage_transform(executor, analysis, mappings, downstream_repo, conventions)
@@ -544,8 +547,6 @@ def run_sync_batch(
 
             all_transformations.extend(t_list)
             all_conflicts.extend(c_list)
-
-            result.analyses.append(analysis)
 
             # Persist new mappings as we go
             new_mappings = mappings.get("new_mappings", [])

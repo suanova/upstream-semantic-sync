@@ -28,3 +28,6 @@ outputs:
   - name: conflicts
     type: list[object]
     description: Conflicts that truly cannot be resolved (SYNC markers only)
+# Second-pass resolution — may need to produce multiple full file contents.
+max_tokens: 16384
+timeout: 300
