@@ -410,7 +410,10 @@ def run_sync_batch(
     # One consolidated PR
     first_sha = commits[0]
     last_sha = commits[-1]
-    branch_name = f"sync/upstream-{first_sha[:12]}..{last_sha[:12]}"
+    if first_sha == last_sha:
+        branch_name = f"sync/upstream-{first_sha[:12]}"
+    else:
+        branch_name = f"sync/upstream-{first_sha[:12]}-{last_sha[:12]}"
     pr_out = stage_create_pr(
         executor, commits, result.analyses, [combined], build_out,
         branch_name, downstream_repo,
