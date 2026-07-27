@@ -35,7 +35,12 @@ def create_pr(
 
     github_token = os.environ.get("GITHUB_TOKEN", "")
     github_actor = os.environ.get("GITHUB_ACTOR", "github-actions[bot]")
-    repo_url = os.environ.get("GITHUB_REPOSITORY", "")
+    repo_slug = os.environ.get("GITHUB_REPOSITORY", "")
+
+    if not github_token:
+        return {"pr_url": "", "pr_number": 0, "status": "error: GITHUB_TOKEN not set"}
+    if not repo_slug:
+        return {"pr_url": "", "pr_number": 0, "status": "error: GITHUB_REPOSITORY not set"}
 
     # ── 1. Configure git identity ──────────────────────────────────────────
     subprocess.run(
@@ -49,9 +54,9 @@ def create_pr(
 
     # ── 2. Configure authenticated push URL ────────────────────────────────
     # Rewrite the origin URL to embed the token for push access
-    if github_token and repo_url:
-        # repo_url is "owner/repo" from GITHUB_REPOSITORY
-        authed_url = f"https://x-access-token:{github_token}@github.com/{repo_url}.git"
+    if github_token and repo_slug:
+        # repo_slug is "owner/repo" from GITHUB_REPOSITORY
+        authed_url = f"https://x-access-token:{github_token}@github.com/{repo_slug}.git"
         subprocess.run(
             ["git", "remote", "set-url", "origin", authed_url],
             cwd=repo_path, check=True, capture_output=True,
@@ -121,7 +126,7 @@ def create_pr(
     # ── 6. Create the PR via GitHub API ───────────────────────────────────
     pr_body = _build_pr_body(upstream_ref, analysis, transformations, build_result)
 
-    api_url = f"https://api.github.com/repos/{repo_url}/pulls"
+    api_url = f"https://api.github.com/repos/{repo_slug}/pulls"
     headers = [
         "-H", "Accept: application/vnd.github+json",
         "-H", f"Authorization: Bearer {github_token}",
@@ -157,7 +162,7 @@ def create_pr(
         labels.append("build-failing")
 
     if pr_number and labels:
-        label_url = f"https://api.github.com/repos/{repo_url}/issues/{pr_number}/labels"
+        label_url = f"https://api.github.com/repos/{repo_slug}/issues/{pr_number}/labels"
         subprocess.run(
             ["curl", "-s", "-X", "POST", label_url] + headers + ["-d", json.dumps({"labels": labels})],
             capture_output=True, text=True,

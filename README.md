@@ -102,6 +102,7 @@ jobs:
       - uses: your-org/upstream-semantic-sync@v1
         with:
           anthropic_auth_token: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          github_token: ${{ github.token }}
           upstream_repo: 'https://github.com/upstream/repo'
           # since_last defaults to true — syncs all new commits
           # since the last successful run
@@ -113,6 +114,7 @@ jobs:
 - uses: your-org/upstream-semantic-sync@v1
   with:
     anthropic_auth_token: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+    github_token: ${{ github.token }}
     upstream_repo: 'https://github.com/upstream/repo'
     since_last: 'false'
     commit: 'abc1234'
@@ -146,6 +148,7 @@ To point at a proxy or local gateway instead of the default Anthropic API:
     anthropic_auth_token: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
     anthropic_base_url: 'http://127.0.0.1:8080'
     model: 'claude-sonnet-5-20250514'
+    github_token: ${{ github.token }}
     upstream_repo: 'https://github.com/upstream/repo'
 ```
 
@@ -268,6 +271,7 @@ jobs:
       - uses: your-org/upstream-semantic-sync@v1
         with:
           anthropic_auth_token: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+          github_token: ${{ github.token }}
           upstream_repo: 'https://github.com/upstream/repo'
           upstream_branch: 'main'
           # since_last: 'true' is the default — syncs all new commits

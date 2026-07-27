@@ -11,18 +11,23 @@
 #   jobs:
 #     sync:
 #       runs-on: ubuntu-latest
+#       permissions:
+#         contents: write
+#         pull-requests: write
 #       steps:
 #         - uses: actions/checkout@v4
-#         - uses: upstream-semantic-sync@v1
+#         - uses: suanova/upstream-semantic-sync@v1
 #           with:
 #             anthropic_auth_token: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+#             github_token: ${{ github.token }}
 #             upstream_repo: 'https://github.com/upstream/repo'
 #
 # One-off usage (sync a specific commit):
 #
-#   - uses: upstream-semantic-sync@v1
+#   - uses: suanova/upstream-semantic-sync@v1
 #     with:
 #       anthropic_auth_token: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
+#       github_token: ${{ github.token }}
 #       upstream_repo: 'https://github.com/upstream/repo'
 #       commit: 'abc1234'
 # ─────────────────────────────────────────────────────────────────────────────
@@ -43,6 +48,9 @@ inputs:
     description: 'Model ID for skill execution'
     required: false
     default: 'claude-sonnet-5-20250514'
+  github_token:
+    description: 'GitHub token for git push and PR creation (pass github.token from the workflow)'
+    required: true
   upstream_repo:
     description: 'Upstream repository URL'
     required: true
@@ -77,17 +85,6 @@ inputs:
     required: false
     default: 'knowledge'
 
-outputs:
-  pr_url:
-    description: 'URL of the created pull request'
-    value: ${{ steps.sync.outputs.pr_url }}
-  pr_number:
-    description: 'Number of the created pull request'
-    value: ${{ steps.sync.outputs.pr_number }}
-  result:
-    description: 'JSON result of the sync pipeline'
-    value: ${{ steps.sync.outputs.result }}
-
 runs:
   using: 'docker'
   image: 'Dockerfile'
@@ -95,14 +92,14 @@ runs:
     ANTHROPIC_AUTH_TOKEN: ${{ inputs.anthropic_auth_token }}
     ANTHROPIC_BASE_URL: ${{ inputs.anthropic_base_url }}
     ANTHROPIC_MODEL: ${{ inputs.model }}
-    GITHUB_TOKEN: ${{ github.token }}
+    GITHUB_TOKEN: ${{ inputs.github_token }}
     UPSTREAM_REPO: ${{ inputs.upstream_repo }}
     UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
     MAX_RISK: ${{ inputs.max_risk }}
     DRY_RUN: ${{ inputs.dry_run }}
   args:
     - '--repo'
-    - ${{ github.workspace }}
+    - '/github/workspace'
     - '--upstream'
     - ${{ inputs.upstream_repo }}
     - '--branch'
