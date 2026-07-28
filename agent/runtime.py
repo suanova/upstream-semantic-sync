@@ -283,6 +283,23 @@ def _hunks_only(diff_text: str) -> str:
     )
 
 
+def _extract_hunk_lines(diff_text: str) -> list[int]:
+    """Return the downstream line numbers touched by unified-diff hunks.
+
+    Parses ``@@ -old_start,old_count +new_start,new_count @@`` headers
+    and returns a sorted list of *new* (downstream) line numbers that the
+    hunks modify.  Used to extract only the relevant region from a large
+    downstream file so the LLM prompt stays small.
+    """
+    import re as _re
+    lines: list[int] = []
+    for m in _re.finditer(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", diff_text):
+        start = int(m.group(1))
+        count = int(m.group(2) or "1")
+        lines.extend(range(start, start + count))
+    return sorted(set(lines))
+
+
 def _unified_diff(old: str, new: str, path: str) -> str:
     import difflib
     return "".join(
@@ -714,19 +731,6 @@ def stage_resolve_conflicts(
         path = conflict.get("path", "")
         upstream_path = conflict.get("upstream_path", "")
 
-        # Read the downstream file content (truncated)
-        downstream_file = ""
-        if path and repo_path:
-            full = os.path.join(repo_path, path)
-            if os.path.exists(full):
-                try:
-                    with open(full) as f:
-                        downstream_file = f.read()
-                except Exception:
-                    pass
-        if len(downstream_file) > MAX_FILE_SIZE:
-            downstream_file = downstream_file[:MAX_FILE_SIZE] + "\n... (truncated)"
-
         # The conflict should already carry the per-file upstream diff
         # (attached by stage_apply_direct). Fall back to fetching it.
         upstream_file_diff = conflict.get("upstream_diff", "")
@@ -740,6 +744,51 @@ def stage_resolve_conflicts(
                 )
         if len(upstream_file_diff) > MAX_DIFF_SIZE:
             upstream_file_diff = upstream_file_diff[:MAX_DIFF_SIZE] + "\n... (truncated)"
+
+        # Read the downstream file — but only send the region around the
+        # conflict hunks to the LLM, not the entire file.  The edit-applier
+        # re-reads the full file from disk, so the LLM never needs more
+        # than enough context to write correct old/new edit blocks.
+        CONTEXT_MARGIN = 50  # lines above/below each hunk region
+        downstream_file = ""
+        if path and repo_path:
+            full = os.path.join(repo_path, path)
+            if os.path.exists(full):
+                try:
+                    with open(full) as f:
+                        downstream_file = f.read()
+                except Exception:
+                    pass
+
+        hunk_lines = _extract_hunk_lines(upstream_file_diff)
+        if hunk_lines and len(downstream_file) > MAX_FILE_SIZE:
+            # Extract only the lines around the conflict, with line numbers
+            # so the LLM can locate code precisely.
+            file_lines = downstream_file.splitlines()
+            # Merge overlapping margins into a single span.
+            lo = max(1, hunk_lines[0] - CONTEXT_MARGIN)
+            hi = min(len(file_lines), hunk_lines[-1] + CONTEXT_MARGIN)
+            snippet = file_lines[lo - 1 : hi]
+            numbered = []
+            for i, line in enumerate(snippet, start=lo):
+                numbered.append(f"{i:>5} | {line}")
+            downstream_file = "\n".join(numbered)
+            downstream_file = (
+                f"(showing lines {lo}–{hi} of {len(file_lines)} — "
+                f"edits are applied to the full file on disk)\n\n"
+                + downstream_file
+            )
+        elif hunk_lines and len(downstream_file) <= MAX_FILE_SIZE:
+            # Small file — send the whole thing but with line numbers so
+            # the LLM can reference locations precisely.
+            file_lines = downstream_file.splitlines()
+            numbered = []
+            for i, line in enumerate(file_lines, start=1):
+                numbered.append(f"{i:>5} | {line}")
+            downstream_file = "\n".join(numbered)
+        elif len(downstream_file) > MAX_FILE_SIZE:
+            # No hunk info available — fall back to truncated head.
+            downstream_file = downstream_file[:MAX_FILE_SIZE] + "\n... (truncated)"
 
         log.info("Resolving %s", path)
 
@@ -1239,14 +1288,41 @@ def main() -> None:
     if not args.verbose and os.environ.get("VERBOSE", "").lower() in ("true", "1", "yes"):
         args.verbose = True
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        # No timestamps: GitHub Actions prefixes its own on every log line,
-        # so ours would be redundant noise. Logs go to stdout (not the
-        # default stderr) so they appear inline in the Action log stream.
-        format="[%(name)s] %(levelname)s: %(message)s",
-        stream=sys.stdout,
-    )
+    # In GitHub Actions, verbose debug logs are written to a file under
+    # the artifacts directory instead of stdout — this keeps the step log
+    # clean while still preserving all debug detail as a downloadable
+    # artifact. When running locally, verbose logs go to stdout as before.
+    _verbose_log_path: Path | None = None
+    if args.verbose and os.environ.get("GITHUB_ACTIONS") == "true":
+        art_root = resolve_knowledge_dir(args.repo) / ".sync-artifacts"
+        art_root.mkdir(parents=True, exist_ok=True)
+        _verbose_log_path = art_root / "debug.log"
+        _verbose_log_path.touch()
+
+        # INFO+ goes to stdout (visible in the Actions step log).
+        # DEBUG+ goes to the debug.log file (captured as an artifact).
+        file_handler = logging.FileHandler(str(_verbose_log_path), mode="a")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter(
+            "[%(name)s] %(levelname)s: %(message)s",
+        ))
+
+        logging.basicConfig(
+            level=logging.INFO,
+            format="[%(name)s] %(levelname)s: %(message)s",
+            stream=sys.stdout,
+        )
+        logging.getLogger().addHandler(file_handler)
+        log.info("Verbose debug log → %s", _verbose_log_path)
+    else:
+        logging.basicConfig(
+            level=logging.DEBUG if args.verbose else logging.INFO,
+            # No timestamps: GitHub Actions prefixes its own on every log line,
+            # so ours would be redundant noise. Logs go to stdout (not the
+            # default stderr) so they appear inline in the Action log stream.
+            format="[%(name)s] %(levelname)s: %(message)s",
+            stream=sys.stdout,
+        )
 
     # In verbose mode the anthropic/httpx SDKs dump raw request dicts as a
     # single escaped line — unreadable. We emit our own readable request log

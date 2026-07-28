@@ -57,4 +57,4 @@ outputs:
     type: boolean
     description: True if still cannot be resolved
 max_tokens: 8192
-timeout: 180
+timeout: 300

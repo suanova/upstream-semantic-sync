@@ -29,6 +29,12 @@ the upstream diff and express it in the downstream file — as a small set of
 {{downstream_file}}
 ```
 
+If the file is large, only the relevant region is shown (with line
+numbers in the left margin and a note saying which lines are included).
+Edits are applied to the **full file on disk** — your `old` blocks must
+match the text exactly (strip the line-number prefix when writing `old`
+and `new`).
+
 ## Output Format — targeted edits (IMPORTANT)
 
 Return ONLY a JSON object — no text before or after. Your edits are applied
