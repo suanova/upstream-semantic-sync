@@ -1,8 +1,16 @@
 """
 upstream-semantic-sync — Runtime
 
-Main entry point for the semantic sync agent. Orchestrates the full pipeline:
-analyze → map → transform → fix → PR.
+Main entry point for the semantic sync agent. Orchestrates the pipeline:
+analyze → map → apply → resolve → fix → PR.
+
+The pipeline is deliberately LLM-light:
+- `apply` rewrites each upstream per-file diff to the mapped downstream
+  path and runs `git apply` directly — no LLM at all for clean applies.
+- The LLM is only invoked for files whose diff fails to apply, using
+  knowledge/conventions.md to adapt the change (one small call per file).
+This keeps prompts tiny and avoids the gateway timeouts caused by sending
+whole changesets (or whole files) through the model.
 
 Modes:
     --commit <sha>      Sync a single upstream commit (creates its own PR)
@@ -57,6 +65,35 @@ def load_conventions(knowledge_dir: Path) -> str:
             log.info("Loaded conventions from %s (%d chars)", path, len(content))
             return content
     return ""
+
+
+def apply_edits(file_text: str, edits: list[dict[str, str]]) -> str:
+    """Apply search/replace edits to file text.
+
+    Each edit is {"old": ..., "new": ...}. The `old` block must appear
+    exactly once in the file — this keeps edits unambiguous without any
+    line-number math from the LLM (which is frequently off by a few lines).
+
+    Raises ValueError describing the first edit that cannot be applied.
+    Returns the modified text.
+    """
+    for i, edit in enumerate(edits, 1):
+        old = edit.get("old", "")
+        new = edit.get("new", "")
+        if not old:
+            raise ValueError(f"edit {i}: empty 'old' block")
+        count = file_text.count(old)
+        if count == 0:
+            snippet = old[:80].replace("\n", "\\n")
+            raise ValueError(f"edit {i}: 'old' block not found in file: {snippet!r}")
+        if count > 1:
+            snippet = old[:80].replace("\n", "\\n")
+            raise ValueError(
+                f"edit {i}: 'old' block matches {count} locations — "
+                f"needs more surrounding context: {snippet!r}"
+            )
+        file_text = file_text.replace(old, new, 1)
+    return file_text
 
 
 def apply_transformations(repo_path: str, transformations: list[dict[str, Any]]) -> list[str]:
@@ -210,6 +247,7 @@ class BatchResult:
     build_status: str = "unknown"
     pr_url: str = ""
     pr_number: int = 0
+    pr_branch: str = ""
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -228,6 +266,69 @@ class BatchResult:
 
 
 # ── Pipeline stages ──────────────────────────────────────────────────────────
+
+def _artifacts_dir(knowledge_dir: Path, commit_sha: str) -> Path:
+    """Per-commit directory for reviewable sync artifacts."""
+    d = knowledge_dir / ".sync-artifacts" / commit_sha[:12]
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _hunks_only(diff_text: str) -> str:
+    """Strip extended headers (index lines etc.) for compact display."""
+    skip = ("index ", "similarity index", "old mode", "new mode", "new file mode", "deleted file mode")
+    return "\n".join(
+        line for line in diff_text.splitlines()
+        if not any(line.startswith(s) for s in skip)
+    )
+
+
+def _unified_diff(old: str, new: str, path: str) -> str:
+    import difflib
+    return "".join(
+        difflib.unified_diff(
+            old.splitlines(keepends=True),
+            new.splitlines(keepends=True),
+            fromfile=f"a/{path}",
+            tofile=f"b/{path}",
+        )
+    )
+
+
+def _append_resolution_summary(
+    knowledge_dir: Path,
+    commit_sha: str,
+    result_path: str,
+    result: dict,
+    resolved_ok: bool,
+    resolution: str,
+    conflict: dict,
+) -> None:
+    """Append the LLM resolution outcome to the per-commit SUMMARY.md."""
+    art = _artifacts_dir(knowledge_dir, commit_sha or "unknown")
+    summary_path = art / "SUMMARY.md"
+    safe = result_path.replace("/", "__")
+    lines = ["", f"### Resolution — `{result_path}`", ""]
+    if resolved_ok:
+        lines.append(f"- Status: resolved (confidence {result.get('confidence', '?')})")
+        notes = result.get("notes", "")
+        if notes:
+            lines.append(f"- Notes: {notes}")
+        lines.append(f"- Resolution diff: `{safe}.resolution.diff`")
+        if resolution:
+            lines.append("")
+            lines.append("```diff")
+            lines.append(resolution.rstrip("\n"))
+            lines.append("```")
+    else:
+        desc = result.get("conflict_description") or conflict.get("description", "")
+        lines.append("- Status: **unresolved**")
+        if desc:
+            lines.append(f"- Reason: {desc}")
+    lines.append("")
+    with open(summary_path, "a") as f:
+        f.write("\n".join(lines))
+
 
 def stage_fetch_commit(repo_url: str, commit_sha: str, branch: str, knowledge_dir: Path) -> str:
     """Fetch the commit diff from upstream so the LLM can analyze it."""
@@ -258,15 +359,92 @@ def stage_fetch_commit(repo_url: str, commit_sha: str, branch: str, knowledge_di
     )
     header = result.stdout.strip()
 
+    # --stat gives the classifier the full file list + change sizes for free;
+    # --name-only (parsed locally by fetch_changed_paths) is the authoritative
+    # path list used for mapping/applying — we never trust the LLM's paths.
     result = subprocess.run(
-        ["git", "diff-tree", "--patch", "--stat", commit_sha],
+        ["git", "diff-tree", "--no-commit-id", "--stat", commit_sha],
+        cwd=str(clone_dir), capture_output=True, text=True, check=True,
+    )
+    stat = result.stdout
+
+    # The classification task only needs a *taste* of the diff — change_type
+    # and risk are judged from the message + file list + a couple of KB of
+    # actual hunks. Keeping this small is the main token saving in analyze.
+    result = subprocess.run(
+        ["git", "diff-tree", "--no-commit-id", "--patch", commit_sha],
         cwd=str(clone_dir), capture_output=True, text=True, check=True,
     )
     diff = result.stdout
-    if len(diff) > 8192:
-        diff = diff[:8192] + "\n... (truncated)"
+    if len(diff) > 2048:
+        diff = diff[:2048] + "\n... (truncated — full file list in the stat above)"
 
-    return f"## Commit metadata\n\n{header}\n\n## Diff\n\n```diff\n{diff}\n```"
+    return f"## Commit metadata\n\n{header}\n\n## Changed files (stat)\n\n```\n{stat}\n```\n\n## Diff (partial)\n\n```diff\n{diff}\n```"
+
+
+def fetch_changed_paths(repo_url: str, commit_sha: str, branch: str, knowledge_dir: Path) -> list[str]:
+    """Return the exact list of paths changed by the commit, from git.
+
+    Authoritative replacement for the LLM's affected_paths — an LLM can
+    hallucinate or drop paths, git cannot. Renames report the new path,
+    which is what the mapping stage needs.
+    """
+    import subprocess
+
+    upstream_dir = knowledge_dir / ".upstream-cache"
+    repo_name = repo_url.rstrip("/").removesuffix(".git").rsplit("/", 1)[-1]
+    clone_dir = upstream_dir / repo_name
+
+    if not clone_dir.exists():
+        return []
+
+    result = subprocess.run(
+        ["git", "diff-tree", "--root", "--no-commit-id", "-r",
+         "--diff-filter=ACDMRT", "--name-only", commit_sha],
+        cwd=str(clone_dir), capture_output=True, text=True,
+    )
+    return [p for p in result.stdout.splitlines() if p.strip()]
+
+
+def fetch_file_diff(
+    repo_url: str,
+    commit_sha: str,
+    branch: str,
+    knowledge_dir: Path,
+    file_path: str,
+    max_chars: int = 4096,
+) -> str:
+    """Fetch the upstream diff for a single file within a commit.
+
+    Returns just the diff hunks for the specified file, much smaller than
+    the full commit diff. Pass max_chars=0 to get the complete untruncated
+    diff — required when the diff will be fed to `git apply`, since a
+    truncated patch can never apply.
+
+    The trailing newline is preserved deliberately: `git apply` expects the
+    patch to end with one.
+    """
+    import subprocess
+
+    upstream_dir = knowledge_dir / ".upstream-cache"
+    repo_name = repo_url.rstrip("/").removesuffix(".git").rsplit("/", 1)[-1]
+    clone_dir = upstream_dir / repo_name
+
+    if not clone_dir.exists():
+        return ""
+
+    result = subprocess.run(
+        # --no-commit-id: diff-tree otherwise prints the commit SHA as its
+        # first line, which corrupts the patch for `git apply`.
+        ["git", "diff-tree", "--root", "--no-commit-id", "--patch", commit_sha, "--", file_path],
+        cwd=str(clone_dir), capture_output=True, text=True,
+    )
+    diff = result.stdout
+    if not diff.strip():
+        return ""
+    if max_chars and len(diff) > max_chars:
+        diff = diff[:max_chars] + "\n... (truncated)\n"
+    return diff
 
 
 def stage_analyze(executor: Executor, repo_url: str, commit_sha: str, branch: str, commit_data: str) -> dict:
@@ -290,80 +468,209 @@ def stage_map(executor: Executor, analysis: dict) -> dict:
     )
 
 
-def stage_transform(executor: Executor, analysis: dict, mappings: dict, repo_path: str = "", conventions: str = "") -> dict:
-    """Stage 3: Transform upstream changes for downstream.
+def rewrite_diff_paths(diff_text: str, upstream_path: str, downstream_path: str) -> tuple[str, str, str]:
+    """Rewrite a per-file unified diff so it applies at the downstream path.
 
-    Calls the LLM once per downstream target file instead of sending all
-    targets in one giant prompt. This avoids gateway timeouts on large
-    changesets and produces better per-file results.
+    Only header lines are rewritten — hunk bodies are left untouched.
+    Rename metadata (similarity index / rename from / rename to) is stripped,
+    turning a rename-with-edits into a plain modify diff against the
+    downstream file. Pure renames (no hunks) cannot be expressed as a modify
+    diff and are reported by the caller as conflicts instead.
+
+    Returns (rewritten_diff, rename_from, rename_to).
     """
-    targets = mappings.get("downstream_targets", [])
-    log.info("Transforming code for %d targets (one LLM call each)", len(targets))
+    rename_from = ""
+    rename_to = ""
+    kept: list[str] = []
+    for line in diff_text.split("\n"):
+        if line.startswith("similarity index "):
+            continue
+        if line.startswith("rename from "):
+            rename_from = line[len("rename from "):].strip()
+            continue
+        if line.startswith("rename to "):
+            rename_to = line[len("rename to "):].strip()
+            continue
+        kept.append(line)
 
-    all_transformations: list[dict] = []
-    all_conflicts: list[dict] = []
+    # For renames, the downstream file's identity is the mapped path
+    # regardless of which side of the rename upstream_path refers to.
+    old_path = rename_from or upstream_path
+    new_path = rename_to or upstream_path
+
+    out: list[str] = []
+    for line in kept:
+        if line.startswith("diff --git "):
+            line = line.replace(f"a/{old_path}", f"a/{downstream_path}")
+            line = line.replace(f"b/{new_path}", f"b/{downstream_path}")
+        elif line == f"--- a/{old_path}":
+            line = f"--- a/{downstream_path}"
+        elif line == f"+++ b/{new_path}":
+            line = f"+++ b/{downstream_path}"
+        out.append(line)
+
+    return "\n".join(out), rename_from, rename_to
+
+
+def stage_apply_direct(analysis: dict, mappings: dict, repo_path: str, knowledge_dir: Path) -> dict:
+    """Stage 3: apply upstream per-file diffs directly to the downstream repo.
+
+    For each mapped target, fetch the upstream diff for just that file,
+    rewrite its paths to the downstream path, and run `git apply`. Files
+    that apply cleanly need NO LLM call — this is what eliminates the huge
+    prompts that caused gateway timeouts.
+
+    Only files whose diff fails to apply become conflicts, to be resolved
+    later by stage_resolve_conflicts (one small LLM call per file, guided
+    by knowledge/conventions.md).
+
+    Returns the same shape as the old transform stage:
+    {"transformations": [...], "conflicts": [...]}.
+    """
+    import subprocess
+
+    targets = mappings.get("downstream_targets", [])
+    upstream_repo = analysis.get("_upstream_repo", "")
+    upstream_branch = analysis.get("_upstream_branch", "main")
+    commit_sha = analysis.get("commit_sha", "")
+
+    log.info("Applying upstream diffs directly for %d targets (no LLM)", len(targets))
+
+    applied: list[dict] = []
+    conflicts: list[dict] = []
 
     for target in targets:
-        downstream_path = target.get("downstream", "")
         upstream_path = target.get("upstream", "")
+        downstream_path = target.get("downstream", "")
 
-        # Read the current downstream file content
-        downstream_file = ""
-        if downstream_path and repo_path:
-            full = os.path.join(repo_path, downstream_path)
-            if os.path.exists(full):
-                try:
-                    with open(full) as f:
-                        downstream_file = f.read()
-                except Exception:
-                    pass
+        if not upstream_path or not downstream_path:
+            log.warning("Skipping target with missing path: %s", target)
+            continue
 
-        log.info(
-            "Transforming %s → %s",
-            upstream_path or "?", downstream_path or "?",
+        # Full, untruncated diff — a truncated patch can never apply.
+        diff = fetch_file_diff(
+            upstream_repo, commit_sha, upstream_branch, knowledge_dir,
+            upstream_path, max_chars=0,
         )
 
-        try:
-            result = executor.run_skill(
-                "transform_single",
-                inputs={
-                    "analysis": analysis,
-                    "mappings": mappings,
-                    "conventions": conventions,
-                    "target_path": downstream_path,
-                    "upstream_path": upstream_path,
-                    "downstream_file": downstream_file,
-                },
-            )
-
-            if result.get("is_conflict"):
-                all_conflicts.append({
-                    "path": result.get("path", downstream_path),
-                    "description": result.get("conflict_description", ""),
-                    "region": result.get("conflict_region", ""),
-                })
-            else:
-                all_transformations.append({
-                    "path": result.get("path", downstream_path),
-                    "content": result.get("content", ""),
-                    "confidence": result.get("confidence", "low"),
-                    "notes": result.get("notes", ""),
-                })
-
-        except Exception as exc:
-            log.warning(
-                "Transform failed for %s: %s — treating as conflict",
-                downstream_path, exc,
-            )
-            all_conflicts.append({
+        if not diff:
+            conflicts.append({
                 "path": downstream_path,
-                "description": f"Transform call failed: {exc}",
+                "upstream_path": upstream_path,
+                "upstream_diff": "",
+                "description": f"No upstream diff found for {upstream_path} in this commit",
                 "region": "",
             })
+            continue
+
+        rewritten, rename_from, rename_to = rewrite_diff_paths(diff, upstream_path, downstream_path)
+
+        # Pure rename (no hunks) — nothing textual to apply; the equivalent
+        # downstream rename needs a human (or a mapping update).
+        if rename_from and "@@" not in rewritten:
+            conflicts.append({
+                "path": downstream_path,
+                "upstream_path": upstream_path,
+                "upstream_diff": "",
+                "description": (
+                    f"Upstream renamed {rename_from} → {rename_to} with no content change; "
+                    "perform the equivalent rename downstream"
+                ),
+                "region": "",
+            })
+            continue
+
+        # Binary changes can't be applied from a text diff.
+        if "Binary files" in rewritten and "GIT binary patch" not in rewritten:
+            conflicts.append({
+                "path": downstream_path,
+                "upstream_path": upstream_path,
+                "upstream_diff": "",
+                "description": "Binary file changed upstream — cannot apply textually",
+                "region": "",
+            })
+            continue
+
+        r = subprocess.run(
+            ["git", "apply", "--allow-empty"],
+            input=rewritten, cwd=repo_path, capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            note = "upstream diff applied directly via git apply"
+            if rename_from:
+                note += f" (content edits only; upstream also renamed {rename_from} → {rename_to})"
+            applied.append({
+                "path": downstream_path,
+                "content": "",
+                "confidence": "high",
+                "notes": note,
+            })
+            log.info("Applied %s → %s", upstream_path, downstream_path)
+        else:
+            stderr = r.stderr.strip()
+            conflicts.append({
+                "path": downstream_path,
+                "upstream_path": upstream_path,
+                "upstream_diff": rewritten,
+                "description": f"git apply failed: {stderr[:400]}",
+                "region": "",
+            })
+            log.info(
+                "Apply failed for %s: %s",
+                downstream_path,
+                stderr.splitlines()[0] if stderr else "unknown error",
+            )
+            # Save the failed patch for review (full-fidelity copy; the
+            # human-readable summary is written after the loop).
+            art = _artifacts_dir(knowledge_dir, commit_sha)
+            safe_name = downstream_path.replace("/", "__")
+            (art / f"{safe_name}.failed.patch").write_text(rewritten)
+
+    # ── Per-commit review summary ─────────────────────────────────────────
+    art = _artifacts_dir(knowledge_dir, commit_sha)
+    if not conflicts:
+        summary_path = art / "SUMMARY.md"
+        if summary_path.exists():
+            summary_path.unlink()
+        log.info("Commit %s: all %d files applied cleanly", commit_sha[:12], len(targets))
+    else:
+        summary = [f"# Sync review — commit {commit_sha[:12]}", ""]
+        summary.append(f"- Applied cleanly: {len(applied)} file(s)")
+        summary.append(f"- Failed direct apply: {len(conflicts)} file(s)")
+        summary.append("")
+        if applied:
+            summary.append("## Applied (no LLM)")
+            for t in applied:
+                summary.append(f"- `{t['path']}` — {t.get('notes', '')}")
+            summary.append("")
+        summary.append("## Conflicts (upstream hunks that failed to apply)")
+        for c in conflicts:
+            cpath = c.get("path", "?")
+            safe = cpath.replace("/", "__")
+            desc = c.get("description", "")
+            summary.append(f"### `{cpath}`")
+            summary.append("")
+            summary.append(f"- Reason: {desc.splitlines()[0] if desc else '?'}")
+            if c.get("upstream_diff"):
+                summary.append(f"- Failed patch: `{safe}.failed.patch`")
+                summary.append("")
+                summary.append("```diff")
+                summary.append(_hunks_only(c["upstream_diff"]))
+                summary.append("```")
+                summary.append("")
+        (art / "SUMMARY.md").write_text("\n".join(summary))
+
+        # Verbose: show each conflict's failing hunks inline.
+        for c in conflicts:
+            if c.get("upstream_diff"):
+                log.debug(
+                    "─── Conflict: %s — hunks that failed to apply ───\n%s",
+                    c.get("path", "?"), _hunks_only(c["upstream_diff"]),
+                )
 
     return {
-        "transformations": all_transformations,
-        "conflicts": all_conflicts,
+        "transformations": applied,
+        "conflicts": conflicts,
         "new_mapping_candidates": [],
         "skipped": [],
     }
@@ -373,23 +680,41 @@ def stage_resolve_conflicts(
     executor: Executor,
     conflicts: list[dict],
     analysis: dict,
-    mappings: dict,
     repo_path: str = "",
     conventions: str = "",
 ) -> dict:
-    """Stage 3b: Resolve transform conflicts via LLM second pass.
+    """Stage 3b: resolve files whose upstream diff failed to apply directly.
 
-    Calls the LLM once per conflicting file with a more aggressive prompt.
+    One LLM call per conflicting file, guided by knowledge/conventions.md.
+    Prompts stay small because the conflict already carries the per-file
+    upstream diff — the only large input is the downstream file itself,
+    which is truncated.
+
+    Returns {"transformations": [...], "conflicts": [...]} where the second
+    list holds only files that remain genuinely unresolved.
     """
-    log.info("Resolving %d conflicts via LLM second pass (one call each)", len(conflicts))
+    log.info("Resolving %d apply failures via LLM (one call each)", len(conflicts))
+
+    # Lightweight analysis summary
+    analysis_summary = {
+        "intent": analysis.get("intent", ""),
+        "change_type": analysis.get("change_type", ""),
+        "risk": analysis.get("risk", ""),
+        "surfaces": analysis.get("surfaces", []),
+        "commit_sha": analysis.get("commit_sha", ""),
+    }
+
+    MAX_FILE_SIZE = 30000
+    MAX_DIFF_SIZE = 4096
 
     all_transformations: list[dict] = []
     remaining_conflicts: list[dict] = []
 
     for conflict in conflicts:
         path = conflict.get("path", "")
+        upstream_path = conflict.get("upstream_path", "")
 
-        # Read the downstream file content
+        # Read the downstream file content (truncated)
         downstream_file = ""
         if path and repo_path:
             full = os.path.join(repo_path, path)
@@ -399,8 +724,24 @@ def stage_resolve_conflicts(
                         downstream_file = f.read()
                 except Exception:
                     pass
+        if len(downstream_file) > MAX_FILE_SIZE:
+            downstream_file = downstream_file[:MAX_FILE_SIZE] + "\n... (truncated)"
 
-        log.info("Resolving conflict for %s", path)
+        # The conflict should already carry the per-file upstream diff
+        # (attached by stage_apply_direct). Fall back to fetching it.
+        upstream_file_diff = conflict.get("upstream_diff", "")
+        if not upstream_file_diff and upstream_path:
+            upstream_repo = analysis.get("_upstream_repo", "")
+            upstream_branch = analysis.get("_upstream_branch", "main")
+            if upstream_repo:
+                upstream_file_diff = fetch_file_diff(
+                    upstream_repo, analysis.get("commit_sha", ""),
+                    upstream_branch, executor.knowledge_dir, upstream_path,
+                )
+        if len(upstream_file_diff) > MAX_DIFF_SIZE:
+            upstream_file_diff = upstream_file_diff[:MAX_DIFF_SIZE] + "\n... (truncated)"
+
+        log.info("Resolving %s", path)
 
         try:
             result = executor.run_skill(
@@ -408,11 +749,12 @@ def stage_resolve_conflicts(
                 inputs={
                     "conflict_description": conflict.get("description", ""),
                     "conflict_region": conflict.get("region", ""),
-                    "analysis": analysis,
-                    "mappings": mappings,
+                    "analysis": analysis_summary,
                     "conventions": conventions,
                     "target_path": path,
+                    "upstream_path": upstream_path,
                     "downstream_file": downstream_file,
+                    "upstream_file_diff": upstream_file_diff,
                 },
             )
 
@@ -422,13 +764,98 @@ def stage_resolve_conflicts(
                     "description": result.get("conflict_description", conflict.get("description", "")),
                     "region": result.get("conflict_region", conflict.get("region", "")),
                 })
-            else:
+                continue
+
+            result_path = result.get("path", path)
+            edits = result.get("edits", [])
+            content = result.get("content", "")
+            resolution = ""
+            resolved_ok = False
+
+            if edits:
+                # Targeted-edit resolution: apply to the FULL file read
+                # fresh from disk (never the truncated prompt copy), so
+                # large files are edited in place without data loss and
+                # the LLM completion stays tiny.
+                full_path = os.path.join(repo_path, result_path)
+                try:
+                    with open(full_path) as f:
+                        full_text = f.read()
+                    new_text = apply_edits(full_text, edits)
+                    with open(full_path, "w") as f:
+                        f.write(new_text)
+                    notes = result.get("notes", "")
+                    all_transformations.append({
+                        "path": result_path,
+                        "content": "",
+                        "confidence": result.get("confidence", "low"),
+                        "notes": f"{notes} (applied {len(edits)} targeted edits)".strip(),
+                    })
+                    log.info("Resolved %s via %d targeted edits", result_path, len(edits))
+                    resolved_ok = True
+                    if new_text != full_text:
+                        resolution = _unified_diff(full_text, new_text, result_path)
+                except FileNotFoundError:
+                    remaining_conflicts.append({
+                        "path": result_path,
+                        "description": "resolve returned edits but the file does not exist downstream",
+                        "region": conflict.get("region", ""),
+                    })
+                except ValueError as exc:
+                    log.warning("Edits failed for %s: %s", result_path, exc)
+                    remaining_conflicts.append({
+                        "path": result_path,
+                        "description": f"LLM edits did not apply: {exc}",
+                        "region": conflict.get("region", ""),
+                    })
+            elif content:
+                # Full-content resolution (new files, or files small enough
+                # that a complete rewrite is cheap). Show + save a diff too.
+                old_text = ""
+                full_path = os.path.join(repo_path, result_path)
+                if os.path.exists(full_path):
+                    try:
+                        with open(full_path) as f:
+                            old_text = f.read()
+                    except Exception:
+                        pass
+                if content != old_text:
+                    resolution = _unified_diff(old_text, content, result_path)
                 all_transformations.append({
-                    "path": result.get("path", path),
-                    "content": result.get("content", ""),
+                    "path": result_path,
+                    "content": content,
                     "confidence": result.get("confidence", "low"),
                     "notes": result.get("notes", ""),
                 })
+                resolved_ok = True
+            else:
+                remaining_conflicts.append({
+                    "path": result_path,
+                    "description": "resolve returned neither edits nor content",
+                    "region": conflict.get("region", ""),
+                })
+
+            # Persist the resolution diff for review and show it in verbose mode.
+            if resolved_ok and resolution:
+                art = _artifacts_dir(executor.knowledge_dir, analysis_summary.get("commit_sha", "unknown"))
+                safe_name = result_path.replace("/", "__")
+                (art / f"{safe_name}.resolution.diff").write_text(resolution)
+                log.debug(
+                    "─── Resolution: %s (confidence %s) — applied diff ───\n%s",
+                    result_path, result.get("confidence", "?"), resolution,
+                )
+
+            # Append the outcome to the per-commit summary written by
+            # stage_apply_direct.
+            _append_resolution_summary(
+                executor.knowledge_dir,
+                analysis_summary.get("commit_sha", "unknown"),
+                result_path,
+                result,
+                resolved_ok,
+                resolution,
+                conflict,
+            )
 
         except Exception as exc:
             log.warning("Resolve failed for %s: %s", path, exc)
@@ -464,6 +891,7 @@ def stage_create_pr(
     build_result: dict,
     branch_name: str,
     repo_path: str,
+    stack_base: str = "",
 ) -> dict:
     """Stage 5: Create a consolidated pull request."""
     log.info("Creating consolidated PR for %d upstream commits", len(upstream_refs))
@@ -476,6 +904,7 @@ def stage_create_pr(
             "transformations": transformations,
             "build_result": build_result,
             "repo_path": repo_path,
+            "stack_base": stack_base,
         },
     )
 
@@ -498,9 +927,22 @@ def run_sync(
     conventions = load_conventions(knowledge_dir)
 
     try:
+        # SHA blocklist is a pure string match — check it before spending
+        # an LLM call on analysis.
+        skip_shas = planner.decisions.get("skip_commits", [])
+        for skip in skip_shas:
+            if commit_sha.startswith(skip):
+                log.info("Skipping: commit in skip list (%s)", skip)
+                result.skipped = True
+                return result
+
         commit_data = stage_fetch_commit(upstream_repo, commit_sha, branch, knowledge_dir)
         analysis = stage_analyze(executor, upstream_repo, commit_sha, branch, commit_data)
         analysis["commit_sha"] = commit_sha
+        analysis["_upstream_repo"] = upstream_repo
+        analysis["_upstream_branch"] = branch
+        # Authoritative path list from git — never trust the LLM's copy.
+        analysis["affected_paths"] = fetch_changed_paths(upstream_repo, commit_sha, branch, knowledge_dir)
         result.intent = analysis.get("intent", "")
         result.change_type = analysis.get("change_type", "")
         result.risk = analysis.get("risk", "")
@@ -514,24 +956,25 @@ def run_sync(
         mappings = stage_map(executor, analysis)
         result.downstream_targets = mappings.get("downstream_targets", [])
 
-        transform_out = stage_transform(executor, analysis, mappings, downstream_repo, conventions)
-        result.transformations = transform_out.get("transformations", [])
-        result.conflicts = transform_out.get("conflicts", [])
+        # Apply upstream diffs directly — no LLM for clean applies
+        apply_out = stage_apply_direct(analysis, mappings, downstream_repo, knowledge_dir)
+        result.transformations = apply_out.get("transformations", [])
+        result.conflicts = apply_out.get("conflicts", [])
 
-        # Resolve conflicts via LLM second pass
+        # Resolve the files that failed to apply, using conventions.md
         if result.conflicts:
             log.info(
-                "Transform produced %d conflicts — attempting resolution",
+                "%d files failed to apply directly — resolving via LLM",
                 len(result.conflicts),
             )
             resolve_out = stage_resolve_conflicts(
-                executor, result.conflicts, analysis, mappings, downstream_repo, conventions,
+                executor, result.conflicts, analysis, downstream_repo, conventions,
             )
             resolved = resolve_out.get("transformations", [])
             if resolved:
                 result.transformations.extend(resolved)
                 apply_transformations(downstream_repo, resolved)
-                log.info("Resolved %d conflicts into transformations", len(resolved))
+                log.info("Resolved %d apply failures into transformations", len(resolved))
             # Keep only truly unresolved conflicts
             result.conflicts = resolve_out.get("conflicts", [])
 
@@ -539,12 +982,12 @@ def run_sync(
             log.info("Dry run — stopping before build fix and PR creation")
             return result
 
-        build_out = stage_build_fix(executor, transform_out, downstream_repo)
+        build_out = stage_build_fix(executor, apply_out, downstream_repo)
         result.build_status = build_out.get("build_status", "unknown")
 
         branch_name = f"sync/upstream-{commit_sha[:12]}"
         pr_out = stage_create_pr(
-            executor, [commit_sha], [analysis], [transform_out], build_out,
+            executor, [commit_sha], [analysis], [apply_out], build_out,
             branch_name, downstream_repo,
         )
         result.pr_url = pr_out.get("pr_url", "")
@@ -572,8 +1015,13 @@ def run_sync_batch(
     commits: list[str],
     branch: str = "main",
     dry_run: bool = False,
+    stack_base: str = "",
 ) -> BatchResult:
-    """Analyze/map/transform each commit, then create one consolidated PR."""
+    """Analyze/map/apply each commit, then create one consolidated PR.
+
+    stack_base: name of a previous batch's sync branch to stack this batch's
+    PR on (used by chunked multi-batch runs in --since-last mode).
+    """
 
     result = BatchResult(commit_shas=commits)
     knowledge_dir = resolve_knowledge_dir(downstream_repo)
@@ -583,13 +1031,28 @@ def run_sync_batch(
 
     all_transformations: list[dict] = []
     all_conflicts: list[dict] = []
+    # Per-commit bundles so create_pr can make one commit per upstream commit.
+    synced_shas: list[str] = []
+    per_commit_bundles: list[dict] = []
 
     for sha in commits:
         try:
+            # SHA blocklist is a pure string match — check it before
+            # spending an LLM call on analysis.
+            skip_shas = planner.decisions.get("skip_commits", [])
+            if any(sha.startswith(skip) for skip in skip_shas):
+                log.info("Skipping commit %s: in skip list", sha[:12])
+                result.skipped_commits.append(sha)
+                continue
+
             # Fetch + analyze
             commit_data = stage_fetch_commit(upstream_repo, sha, branch, knowledge_dir)
             analysis = stage_analyze(executor, upstream_repo, sha, branch, commit_data)
             analysis["commit_sha"] = sha
+            analysis["_upstream_repo"] = upstream_repo
+            analysis["_upstream_branch"] = branch
+            # Authoritative path list from git — never trust the LLM's copy.
+            analysis["affected_paths"] = fetch_changed_paths(upstream_repo, sha, branch, knowledge_dir)
 
             # Check policy
             if not planner.should_sync(analysis):
@@ -597,37 +1060,38 @@ def run_sync_batch(
                 result.skipped_commits.append(sha)
                 continue
 
-            # Track this commit's analysis even if transform fails later
+            # Track this commit's analysis even if apply fails later
             result.analyses.append(analysis)
 
-            # Map + transform
+            # Map + apply upstream diffs directly (no LLM for clean applies)
             mappings = stage_map(executor, analysis)
-            transform_out = stage_transform(executor, analysis, mappings, downstream_repo, conventions)
+            apply_out = stage_apply_direct(analysis, mappings, downstream_repo, knowledge_dir)
 
-            t_list = transform_out.get("transformations", [])
-            c_list = transform_out.get("conflicts", [])
+            t_list = apply_out.get("transformations", [])
+            c_list = apply_out.get("conflicts", [])
 
-            # Apply the transformations to disk
-            if t_list:
-                apply_transformations(downstream_repo, t_list)
-
-            # Resolve conflicts via LLM second pass
+            # Resolve the files that failed to apply, using conventions.md
             if c_list:
                 log.info(
-                    "Transform produced %d conflicts for %s — attempting resolution",
+                    "%d files failed to apply directly for %s — resolving via LLM",
                     len(c_list), sha[:12],
                 )
                 resolve_out = stage_resolve_conflicts(
-                    executor, c_list, analysis, mappings, downstream_repo, conventions,
+                    executor, c_list, analysis, downstream_repo, conventions,
                 )
                 resolved = resolve_out.get("transformations", [])
                 if resolved:
                     apply_transformations(downstream_repo, resolved)
                     t_list.extend(resolved)
-                    log.info("Resolved %d conflicts into transformations for %s", len(resolved), sha[:12])
+                    log.info("Resolved %d apply failures into transformations for %s", len(resolved), sha[:12])
                 # Keep only truly unresolved conflicts
                 c_list = resolve_out.get("conflicts", [])
 
+            synced_shas.append(sha)
+            per_commit_bundles.append({
+                "transformations": t_list,
+                "conflicts": c_list,
+            })
             all_transformations.extend(t_list)
             all_conflicts.extend(c_list)
 
@@ -646,6 +1110,15 @@ def run_sync_batch(
 
     if not result.analyses:
         log.info("No commits to sync after policy filtering")
+        # Everything was deliberately skipped (and nothing failed) — advance
+        # the pointer past the skipped commits so they aren't re-analyzed
+        # (and re-billed) on every future run.
+        if result.skipped_commits and not result.failed_commits:
+            planner.set_last_synced_sha(upstream_repo, branch, commits[-1])
+            log.info(
+                "All %d commits skipped — advanced last synced SHA to %s",
+                len(result.skipped_commits), commits[-1][:12],
+            )
         return result
 
     if dry_run:
@@ -660,35 +1133,75 @@ def run_sync_batch(
     build_out = stage_build_fix(executor, combined, downstream_repo)
     result.build_status = build_out.get("build_status", "unknown")
 
-    # One consolidated PR
+    # One PR containing one commit per upstream commit.
     first_sha = commits[0]
     last_sha = commits[-1]
     if first_sha == last_sha:
         branch_name = f"sync/upstream-{first_sha[:12]}"
     else:
         branch_name = f"sync/upstream-{first_sha[:12]}-{last_sha[:12]}"
-    pr_out = stage_create_pr(
-        executor, commits, result.analyses, [combined], build_out,
-        branch_name, downstream_repo,
-    )
-    result.pr_url = pr_out.get("pr_url", "")
-    result.pr_number = pr_out.get("pr_number", 0)
 
-    # Record adopted commits in changelog
+    # Write the changelog + advance the sync pointer BEFORE creating the PR,
+    # so both ride into the PR's last commit (previously they were written
+    # after create_pr, so they never made it into the branch).
     adopted_shas = [a["commit_sha"] for a in result.analyses if "commit_sha" in a]
     append_changelog(downstream_repo, upstream_repo, branch, adopted_shas, result.analyses)
 
-    # Advance last-synced SHA — only if we actually applied transformations
+    old_sync_state = planner.get_last_synced_sha(upstream_repo, branch)
+    advanced = False
     if all_transformations:
         planner.set_last_synced_sha(upstream_repo, branch, last_sha)
+        advanced = True
         log.info("Advanced last synced SHA to %s", last_sha[:12])
     else:
         log.warning("No transformations applied — not advancing last synced SHA")
+
+    pr_out = stage_create_pr(
+        executor, synced_shas, result.analyses, per_commit_bundles, build_out,
+        branch_name, downstream_repo, stack_base=stack_base,
+    )
+    result.pr_url = pr_out.get("pr_url", "")
+    result.pr_number = pr_out.get("pr_number", 0)
+    # Stack only when a branch was actually pushed (PR created). A
+    # "no_changes" or error result leaves stack_base unchanged for the
+    # next batch.
+    if pr_out.get("status") == "created" and result.pr_url:
+        result.pr_branch = branch_name
+
+    if advanced and not result.pr_url:
+        # PR creation failed — roll the pointer back so the next run retries
+        # these commits instead of silently skipping them.
+        if old_sync_state:
+            planner.set_last_synced_sha(upstream_repo, branch, old_sync_state)
+        log.warning("PR creation failed — reverted last synced SHA")
 
     return result
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
+
+def _print_review_hint(repo_path: str, knowledge_dir: Path, dry_run: bool, has_conflicts: bool) -> None:
+    """Point the user at reviewable output after a run."""
+    hints = []
+    if dry_run:
+        hints.append(f"review applied changes:  git -C {repo_path} diff")
+        hints.append(f"discard them:            git -C {repo_path} checkout -- .")
+    art = knowledge_dir / ".sync-artifacts"
+    if art.exists():
+        # In a GitHub Action the workspace is discarded after the run — the
+        # artifacts only survive if the workflow uploads them.
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            hints.append(
+                "conflict+resolution reports: upload them with "
+                "actions/upload-artifact (path: knowledge/.sync-artifacts/)"
+            )
+        else:
+            hints.append(f"per-commit conflict+resolution review: {art}/<sha>/SUMMARY.md")
+    if has_conflicts:
+        hints.append("unresolved conflicts remain — see the log above and the artifacts")
+    for h in hints:
+        print(f"  ▸ {h}")
+
 
 def main() -> None:
     import sys
@@ -705,17 +1218,41 @@ def main() -> None:
         help="Sync all upstream commits since the last synced SHA (for scheduled runs)",
     )
     parser.add_argument("--branch", default="main", help="Upstream branch (default: main)")
-    parser.add_argument("--limit", type=int, default=1, help="Max commits to adopt per run (0 = unlimited)")
+    parser.add_argument(
+        "--limit", type=int, default=10,
+        help="Commits per batch/PR. If more new commits exist, the runtime "
+             "loops over additional batches, stacking each PR on the previous "
+             "(0 = single batch with everything). Default: 10",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Stop before creating PR")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
-    parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Debug output: conflict hunks, LLM requests/responses, resolution diffs. "
+             "Can also be enabled by setting VERBOSE=true in the environment "
+             "(this is how the GitHub Action passes it).",
+    )
 
     args = parser.parse_args()
+    # Allow the Action to enable verbose logs via env var (action.yml maps
+    # its `verbose` input to VERBOSE). CLI flag wins if both are set.
+    if not args.verbose and os.environ.get("VERBOSE", "").lower() in ("true", "1", "yes"):
+        args.verbose = True
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        # No timestamps: GitHub Actions prefixes its own on every log line,
+        # so ours would be redundant noise. Logs go to stdout (not the
+        # default stderr) so they appear inline in the Action log stream.
+        format="[%(name)s] %(levelname)s: %(message)s",
+        stream=sys.stdout,
     )
+
+    # In verbose mode the anthropic/httpx SDKs dump raw request dicts as a
+    # single escaped line — unreadable. We emit our own readable request log
+    # in executor instead, so keep the SDK loggers at INFO regardless.
+    for noisy in ("anthropic", "anthropic._base_client", "httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.INFO)
 
     # In Docker-based GitHub Actions, the container runs as root but the
     # workspace is owned by the runner user. Git refuses to operate on
@@ -750,40 +1287,90 @@ def main() -> None:
             print("Upstream is up to date.")
             sys.exit(0)
 
-        # Apply limit
+        # Chunk into batches of --limit commits. Each batch becomes one PR;
+        # when there are multiple batches the runtime loops, stacking each
+        # batch's branch on the previous one (upstream commits are
+        # sequential — batch N's diffs only apply cleanly on batch N-1's
+        # tree). A dry run processes only the first batch: no PRs are
+        # created, so reviewing one batch is enough.
         total = len(commits)
-        if args.limit > 0 and total > args.limit:
-            log.info("Limiting to %d of %d new commits (use --limit to change)", args.limit, total)
-            commits = commits[:args.limit]
+        if args.limit <= 0:
+            batches = [commits]
+        else:
+            batches = [commits[i:i + args.limit] for i in range(0, total, args.limit)]
 
-        batch_result = run_sync_batch(args.repo, args.upstream, commits, args.branch, args.dry_run)
+        if args.dry_run and len(batches) > 1:
+            log.info(
+                "%d new commits (%d batches of %d) — dry run processes the first batch only",
+                total, len(batches), args.limit,
+            )
+            batches = batches[:1]
+        elif len(batches) > 1:
+            log.info(
+                "%d new commits — running %d batches of up to %d commits each (one PR per batch, stacked)",
+                total, len(batches), args.limit,
+            )
+
+        all_results: list[BatchResult] = []
+        batch_commits: list[list[str]] = []
+        stack_base = ""
+        overall_ok = True
+
+        for idx, batch in enumerate(batches, 1):
+            if len(batches) > 1:
+                log.info("── Batch %d/%d: %d commits ──", idx, len(batches), len(batch))
+
+            batch_result = run_sync_batch(
+                args.repo, args.upstream, batch, args.branch, args.dry_run,
+                stack_base=stack_base,
+            )
+            all_results.append(batch_result)
+            batch_commits.append(batch)
+
+            # Stack the next batch on this batch's branch.
+            if batch_result.pr_branch:
+                stack_base = batch_result.pr_branch
+
+            if not batch_result.ok:
+                overall_ok = False
+                log.error("Batch %d/%d failed — stopping", idx, len(batches))
+                break
 
         if args.json:
             print(json.dumps({
-                "commit_count": len(commits),
-                "synced_count": batch_result.synced_count,
-                "skipped_commits": [c[:12] for c in batch_result.skipped_commits],
-                "failed_commits": [c[:12] for c in batch_result.failed_commits],
-                "transformations": len(batch_result.all_transformations),
-                "conflicts": len(batch_result.all_conflicts),
-                "build_status": batch_result.build_status,
-                "pr_url": batch_result.pr_url,
-                "pr_number": batch_result.pr_number,
-                "ok": batch_result.ok,
-                "errors": batch_result.errors,
+                "batch_count": len(all_results),
+                "commit_count": sum(len(c) for c in batch_commits),
+                "synced_count": sum(r.synced_count for r in all_results),
+                "skipped_commits": [c[:12] for r in all_results for c in r.skipped_commits],
+                "failed_commits": [c[:12] for r in all_results for c in r.failed_commits],
+                "transformations": sum(len(r.all_transformations) for r in all_results),
+                "conflicts": sum(len(r.all_conflicts) for r in all_results),
+                "build_status": all_results[-1].build_status if all_results else "unknown",
+                "pr_urls": [r.pr_url for r in all_results if r.pr_url],
+                "pr_numbers": [r.pr_number for r in all_results if r.pr_number],
+                "ok": overall_ok,
+                "errors": [e for r in all_results for e in r.errors],
             }, indent=2))
         else:
-            print(f"Synced {batch_result.synced_count}/{len(commits)} commits")
-            if batch_result.skipped_commits:
-                print(f"  Skipped: {', '.join(c[:12] for c in batch_result.skipped_commits)}")
-            if batch_result.failed_commits:
-                print(f"  Failed: {', '.join(c[:12] for c in batch_result.failed_commits)}")
-            if batch_result.pr_url:
-                print(f"  → {batch_result.pr_url}")
-            for err in batch_result.errors:
-                print(f"  ⚠ {err}")
+            synced = sum(r.synced_count for r in all_results)
+            done = sum(len(c) for c in batch_commits)
+            print(f"Synced {synced}/{done} commits across {len(all_results)} batch(es)")
+            for i, r in enumerate(all_results):
+                prefix = f"  batch {i+1}: " if len(all_results) > 1 else "  "
+                if r.skipped_commits:
+                    print(f"{prefix}Skipped: {', '.join(c[:12] for c in r.skipped_commits)}")
+                if r.failed_commits:
+                    print(f"{prefix}Failed: {', '.join(c[:12] for c in r.failed_commits)}")
+                if r.pr_url:
+                    print(f"{prefix}→ {r.pr_url}")
+                for err in r.errors:
+                    print(f"{prefix}⚠ {err}")
+            _print_review_hint(
+                args.repo, knowledge_dir, args.dry_run,
+                any(r.all_conflicts for r in all_results),
+            )
 
-        if not batch_result.ok:
+        if not overall_ok:
             sys.exit(1)
 
     elif args.commit:

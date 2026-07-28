@@ -47,7 +47,14 @@ class Executor:
             )
 
         base_url = os.environ.get("ANTHROPIC_BASE_URL")
-        client_kwargs: dict[str, Any] = {"api_key": auth_token}
+        client_kwargs: dict[str, Any] = {
+            "api_key": auth_token,
+            # Disable SDK-level retries — our _run_llm method handles
+            # retries with custom backoff and logging. Without this,
+            # the SDK retries 504s silently before our code gets a chance,
+            # which wastes time and produces confusing logs.
+            "max_retries": 0,
+        }
         if base_url:
             client_kwargs["base_url"] = base_url
 
@@ -80,11 +87,11 @@ class Executor:
 
         # LLM handler — need a prompt template
         prompt = self._render_prompt(skill_dir, inputs)
-        return self._run_llm(prompt, meta)
+        return self._run_llm(prompt, meta, skill_name)
 
     # ── LLM execution ───────────────────────────────────────────────────────
 
-    def _run_llm(self, prompt: str, meta: dict[str, Any]) -> dict[str, Any]:
+    def _run_llm(self, prompt: str, meta: dict[str, Any], name: str = "") -> dict[str, Any]:
         """Invoke Claude via the Anthropic Python SDK and parse structured JSON output."""
 
         import time
@@ -93,6 +100,14 @@ class Executor:
         max_tokens = meta.get("max_tokens", 8192)
         timeout = meta.get("timeout", 300)
         max_retries = meta.get("max_retries", 3)
+
+        # Human-readable request log — the SDK's own DEBUG dump is a single
+        # unreadable line with the whole prompt escaped, so we emit our own
+        # (and the SDK loggers are quieted in runtime.main).
+        log.debug(
+            "─── LLM request: %s (model=%s, max_tokens=%d, timeout=%ds, prompt=%d chars) ───\n%s",
+            name or "?", model, max_tokens, timeout, len(prompt), prompt,
+        )
 
         last_exc = None
         for attempt in range(max_retries):
@@ -150,6 +165,7 @@ class Executor:
             block.text for block in response.content if block.type == "text"
         ]
         raw = "\n".join(text_blocks)
+        log.debug("─── LLM response: %s (%d chars) ───\n%s", name or "?", len(raw), raw)
 
         # Parse JSON from the LLM output, which may contain markdown
         # fencing or extra text after the JSON object.

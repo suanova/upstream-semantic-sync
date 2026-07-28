@@ -1,86 +1,137 @@
 # Resolve Single Conflict
 
-You are resolving a conflict for **one downstream target file** that the
-initial transform could not handle. Your job is to **produce a transformation
-anyway** — make your best attempt at adapting the upstream intent to the
-downstream code.
+You are resolving **one downstream file** whose upstream diff failed to apply
+with `git apply`. The direct (no-LLM) apply stage already tried the mechanical
+patch and it did not fit — usually because the downstream fork has diverged:
+renamed symbols, restructured modules, different APIs, or intentional drift.
+
+Your job is to **apply the same change manually**: understand the intent of
+the upstream diff and express it in the downstream file — as a small set of
+**targeted edits**, NOT a full-file rewrite.
 
 ## Context
 
-- **Conflict description:** `{{conflict_description}}`
-- **Conflict region:** `{{conflict_region}}`
-- **Upstream commit analysis:** `{{analysis}}`
-- **Architecture mappings:** `{{mappings}}`
+- **Why the direct apply failed:** `{{conflict_description}}`
+- **Upstream commit summary:** `{{analysis}}`
+- **Upstream file path:** `{{upstream_path}}`
+- **Upstream diff that failed to apply** (paths already rewritten to the
+  downstream path):
+
+```diff
+{{upstream_file_diff}}
+```
+
 - **Downstream conventions:** `{{conventions}}`
-- **Target file path:** `{{target_path}}`
+- **Downstream file path:** `{{target_path}}`
 - **Current downstream file contents:**
 
 ```
 {{downstream_file}}
 ```
 
-## Your Mission
+## Output Format — targeted edits (IMPORTANT)
 
-The first-pass transform flagged this file as a conflict. This is your second
-chance. You MUST produce a transformation. Do NOT set `is_conflict: true`
-unless a `SYNC:FORK_DIVERGED` or `SYNC:MANUAL` marker covers the *entire*
-region that needs to change.
-
-## Strategy
-
-**The Downstream conventions context is your most important input** — it
-explains why the code differs and how to map upstream concepts to downstream
-equivalents. Always check conventions before attempting a resolution.
-
-Common divergence patterns:
-
-1. **Renamed symbols** — upstream calls `oldFunction()`, downstream renamed to
-   `newFunction()`. Replace with the downstream name. Set `confidence: medium`.
-2. **Different module structure** — upstream `core/X`, downstream `foundation/X`.
-   Place in the mapped module. Set `confidence: medium`.
-3. **Diverged signatures** — upstream `handle(x, y)`, downstream `handle(x, y, config)`.
-   Adapt the call. Set `confidence: low`.
-4. **Extra abstractions** — upstream modifies a simple class, downstream wraps it.
-   Apply at the right layer. Set `confidence: low`.
-5. **Already applied** — downstream already has the change.
-   Return current content. Set `confidence: high`.
-6. **SYNC markers** — transform only unmarked parts. If the marker covers
-   everything, set `is_conflict: true`.
-
-## Output Format
-
-Return ONLY a JSON object — no text before or after:
+Return ONLY a JSON object — no text before or after. Your edits are applied
+by exact string match against the file, so keep your response small and
+precise:
 
 ```json
 {
   "path": "downstream/path/to/file",
-  "content": "the complete modified file content",
+  "edits": [
+    {
+      "old": "exact text copied verbatim from the downstream file",
+      "new": "the replacement text"
+    }
+  ],
   "confidence": "<high|medium|low>",
   "notes": "what assumptions you made and why",
   "is_conflict": false
 }
 ```
 
-If a SYNC marker truly covers everything:
+Edit rules:
+
+- **`old` must appear EXACTLY ONCE in the file.** Include enough surrounding
+  lines (a function signature, a distinctive comment) to make it unique.
+  If a block matches multiple locations, the edit is rejected.
+- **Keep each edit minimal.** Touch only what the upstream change requires.
+  Prefer 1–5 small edits over one giant one.
+- **To insert** code, set `old` to the line(s) you anchor on and `new` to
+  those same lines plus the inserted code.
+- **To delete** code, set `new` to `""`.
+- Copy whitespace and indentation exactly from the file contents above.
+- Do NOT reformat, reorder, or "improve" unrelated code.
+- Do NOT restate the whole file. The `edits` array is the entire change.
+
+**Only exception — new files:** if the downstream file does not exist yet
+(the contents above are empty), return the full file instead:
 
 ```json
 {
   "path": "downstream/path/to/file",
-  "content": "",
+  "content": "complete file content",
   "confidence": "low",
-  "notes": "SYNC marker covers entire change region",
+  "notes": "file is new downstream",
+  "is_conflict": false
+}
+```
+
+## Strategy
+
+**The downstream conventions are your most important input** — they explain
+why the code differs and how upstream concepts map to downstream equivalents
+(renamed symbols, split modules, import rewrites, signature differences).
+Always check conventions before attempting a resolution.
+
+**The upstream diff** shows exactly what changed upstream for this file.
+The hunks failed to apply because the surrounding context differs downstream —
+find the *corresponding* code and apply the same intent there.
+
+Common reasons the apply failed, and what to do:
+
+1. **Renamed symbols** — upstream patch touches `oldFunction()`, downstream
+   calls it `newFunction()`. Edit the downstream symbol. `confidence: medium`.
+2. **Moved/split modules** — the target file should already be the mapped
+   one; if the content clearly belongs elsewhere, still edit this target and
+   explain in `notes`. `confidence: medium`.
+3. **Diverged signatures** — upstream `handle(x, y)`, downstream
+   `handle(x, y, config)`. Adapt the call. `confidence: low`.
+4. **Extra abstractions** — upstream modifies a simple class, downstream
+   wraps it. Apply at the right layer. `confidence: low`.
+5. **Context drift** — the same function exists but its body differs enough
+   that the hunks don't match. Locate the equivalent logic and apply the
+   minimal equivalent edit. `confidence: medium`.
+6. **Already applied** — downstream already has the change. Return
+   `"edits": []` with `confidence: high` and note "already applied".
+7. **SYNC markers** — edit only unmarked parts. If a `SYNC:FORK_DIVERGED`
+   or `SYNC:MANUAL` marker covers everything that needs to change, set
+   `is_conflict: true`.
+
+If it truly cannot be resolved:
+
+```json
+{
+  "path": "downstream/path/to/file",
+  "edits": [],
+  "confidence": "low",
+  "notes": "why this cannot be resolved",
   "is_conflict": true,
-  "conflict_description": "why this truly cannot be resolved",
+  "conflict_description": "what a human needs to do",
   "conflict_region": "line range or symbol name"
 }
 ```
 
 ## CRITICAL RULES
 
-- **You MUST produce a transformation.** This is your second chance.
-- Only use `is_conflict: true` if a SYNC marker covers the entire region.
-- Always include the full `content` field with the complete modified file.
-- Adapt to downstream conventions — do NOT copy upstream code verbatim.
-- Set `confidence: low` if uncertain, but still produce the transformation.
-  A low-confidence transformation is infinitely better than a blocking conflict.
+- **You MUST produce edits (or full content for a new file).** The direct
+  apply already failed — you are the fallback, there is no third pass.
+- Every `old` block is matched verbatim against the file. One wrong
+  character or one extra match and the edit is rejected.
+- Adapt to downstream conventions — do NOT copy upstream identifiers
+  verbatim when conventions say they were renamed.
+- Set `confidence: low` if uncertain, but still produce your best edits.
+  A low-confidence edit beats a blocking conflict.
+- If the downstream file contents above are truncated, only edit regions
+  you can actually see — never guess at code beyond the truncation marker.
 - Explain all assumptions in `notes`.

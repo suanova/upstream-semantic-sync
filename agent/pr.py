@@ -37,8 +37,15 @@ def create_pr(
     analyses: list[dict[str, Any]],
     transformations: list[dict[str, Any]],
     build_result: dict[str, Any],
+    stack_base: str = "",
 ) -> dict[str, Any]:
-    """Create a sync branch, commit transformed files, and open a PR."""
+    """Create a sync branch, commit transformed files, and open a PR.
+
+    When stack_base is set (a previous sync branch from the same multi-batch
+    run), the new branch is created off it instead of the base branch, and
+    the PR targets stack_base — upstream commits are sequential, so batch N's
+    changes only apply correctly on top of batch N-1's.
+    """
 
     github_token = os.environ.get("GITHUB_TOKEN", "")
     repo_slug = os.environ.get("GITHUB_REPOSITORY", "")
@@ -72,50 +79,74 @@ def create_pr(
             base_branch = base_branch.removeprefix("refs/heads/")
     log.info("Base branch: %s", base_branch)
 
-    # ── 4. Fetch and create sync branch ───────────────────────────────────
-    _git(repo_path, "fetch", "origin", base_branch)
-
-    # Delete the branch if it already exists from a previous failed run
+    # ── 4. Create the sync branch ────────────────────────────────────────
+    # -B (not -b) so reruns of the same batch reset the branch cleanly.
     _git(repo_path, "branch", "-D", branch_name, check=False)
-    _git(repo_path, "checkout", "-b", branch_name, f"origin/{base_branch}")
+    if stack_base:
+        # Stacked batch: HEAD is the previous batch's branch with this
+        # batch's changes already applied in the working tree. Branch off
+        # HEAD directly; the uncommitted changes carry over untouched.
+        log.info("Stacking %s on top of %s", branch_name, stack_base)
+        _git(repo_path, "checkout", "-B", branch_name)
+        pr_base = stack_base
+    else:
+        _git(repo_path, "fetch", "origin", base_branch)
+        _git(repo_path, "checkout", "-B", branch_name, f"origin/{base_branch}")
+        pr_base = base_branch
 
-    # ── 5. Stage and commit transformed files ──────────────────────────────
-    all_files = []
-    for t_bundle in transformations:
-        for f in t_bundle.get("transformations", []):
-            path = f.get("path", "")
-            if path:
-                all_files.append(path)
+    # ── 5. Commit each upstream commit's files separately ─────────────────
+    # The caller passes one transformation bundle per upstream commit, in
+    # order. We commit bundle-by-bundle so the PR contains one commit per
+    # upstream commit (preserving per-commit history) instead of a single
+    # squashed commit.
+    bundles = transformations if transformations else [{}]
+    n_bundles = len(bundles)
+    n_commits = 0
 
-    for f in build_result.get("fixes_applied", []):
-        path = f.get("path", "")
-        if path:
-            all_files.append(path)
+    for i, bundle in enumerate(bundles):
+        # Match this bundle to its upstream ref + analysis when available.
+        ref = upstream_refs[i] if i < len(upstream_refs) else ""
+        analysis = analyses[i] if i < len(analyses) else {}
 
-    # Deduplicate and stage
-    for path in set(all_files):
-        full = os.path.join(repo_path, path)
-        if os.path.exists(full):
-            _git(repo_path, "add", path)
+        files = [f.get("path", "") for f in bundle.get("transformations", []) if f.get("path")]
+        # Build-fix fixes are appended to the LAST bundle's commit.
+        if i == n_bundles - 1:
+            files += [f.get("path", "") for f in build_result.get("fixes_applied", []) if f.get("path")]
 
-    # Also stage the changelog if it exists
-    changelog_path = os.path.join(repo_path, "CHANGELOG.sync.md")
-    if os.path.exists(changelog_path):
-        _git(repo_path, "add", "CHANGELOG.sync.md")
+        for path in set(files):
+            _git(repo_path, "add", "-A", "--", path, check=False)
 
-    # Build commit message
+        # Changelog goes in the last commit.
+        if i == n_bundles - 1:
+            changelog_path = os.path.join(repo_path, "CHANGELOG.sync.md")
+            if os.path.exists(changelog_path):
+                _git(repo_path, "add", "CHANGELOG.sync.md", check=False)
+
+        intent = analysis.get("intent", "") or "upstream sync"
+        if ref:
+            msg = f"sync(upstream): {intent}\n\nUpstream-commit: {ref}"
+        else:
+            msg = f"sync(upstream): {intent}"
+
+        r = _git(repo_path, "commit", "-m", msg, check=False)
+        if r.returncode != 0:
+            if "nothing to commit" in (r.stdout + r.stderr).lower():
+                log.info("Bundle %d (%s): no changes — skipping empty commit", i, ref[:12] or "?")
+                continue
+            log.warning("Bundle %d commit failed: %s", i, r.stderr.strip())
+            continue
+        n_commits += 1
+        log.info("Committed %s (%s)", ref[:12] or f"bundle {i}", intent[:60])
+
+    if n_commits == 0:
+        log.warning("Nothing to commit — no changes detected")
+        return {"pr_url": "", "pr_number": 0, "status": "no_changes"}
+
+    # PR title reflects the whole set.
     if len(upstream_refs) == 1:
         title = f"sync(upstream): {analyses[0].get('intent', 'upstream sync')}"
     else:
         title = f"sync(upstream): {len(upstream_refs)} commits from upstream"
-
-    refs_str = "\n".join(f"  {ref}" for ref in upstream_refs)
-    commit_msg = f"{title}\n\nUpstream commits:\n{refs_str}"
-
-    r = _git(repo_path, "commit", "-m", commit_msg, check=False)
-    if r.returncode != 0:
-        log.warning("Nothing to commit — no changes detected: %s", r.stderr.strip())
-        return {"pr_url": "", "pr_number": 0, "status": "no_changes"}
 
     # ── 6. Push the branch ─────────────────────────────────────────────────
     # Use --force-with-lease to overwrite if branch existed from a prior run
@@ -135,7 +166,7 @@ def create_pr(
     payload = json.dumps({
         "title": title,
         "head": branch_name,
-        "base": base_branch,
+        "base": pr_base,
         "body": pr_body,
         "draft": has_conflicts or build_result.get("build_status") == "fail",
     })

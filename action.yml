@@ -73,15 +73,19 @@ inputs:
     required: false
     default: ''
   limit:
-    description: 'Max commits to adopt per run (0 = unlimited). Use to limit blast radius on large upstream batches.'
+    description: 'Commits per batch/PR. If more new commits exist, the runtime loops over additional batches, stacking each PR on the previous (0 = single batch).'
     required: false
-    default: '1'
+    default: '10'
   max_risk:
     description: 'Maximum risk level to auto-sync (low, medium, high)'
     required: false
     default: 'medium'
   dry_run:
     description: 'Stop before creating PR (for testing)'
+    required: false
+    default: 'false'
+  verbose:
+    description: 'Debug logs: conflict hunks, LLM requests/responses, resolution diffs'
     required: false
     default: 'false'
   knowledge_dir:
@@ -105,6 +109,7 @@ runs:
     INPUT_COMMIT: ${{ inputs.commit }}
     INPUT_RANGE: ${{ inputs.range }}
     INPUT_DRY_RUN: ${{ inputs.dry_run }}
+    VERBOSE: ${{ inputs.verbose }}
   args:
     - '--repo'
     - '/github/workspace'
@@ -117,8 +122,8 @@ runs:
     - ${{ inputs.commit }}
     - ${{ inputs.range != '' && '--range' || '' }}
     - ${{ inputs.range }}
-    - ${{ inputs.limit != '1' && '--limit' || '' }}
-    - ${{ inputs.limit != '1' && inputs.limit || '' }}
+    - ${{ inputs.limit != '10' && '--limit' || '' }}
+    - ${{ inputs.limit != '10' && inputs.limit || '' }}
     - ${{ inputs.dry_run == 'true' && '--dry-run' || '' }}
     - '--json'
 

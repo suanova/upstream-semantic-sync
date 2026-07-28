@@ -1,13 +1,17 @@
 name: resolve_single
-version: "1.0"
+version: "3.0"
 description: |
-  Second-pass LLM call to resolve a conflict for a single downstream file.
-  Called once per conflict by stage_resolve_conflicts.
+  LLM fallback for a single downstream file whose upstream diff failed to
+  apply with `git apply`. Called once per failed file by
+  stage_resolve_conflicts. Uses knowledge/conventions.md to adapt the
+  upstream intent to the diverged downstream code. Returns targeted
+  search/replace edits (not the full file) so completions stay small
+  even for large files — this avoids gateway timeouts.
 inputs:
   - name: conflict_description
     type: string
     required: true
-    description: Why the initial transform flagged this as a conflict
+    description: Why the direct git apply failed for this file
   - name: conflict_region
     type: string
     required: false
@@ -15,11 +19,7 @@ inputs:
   - name: analysis
     type: object
     required: true
-    description: Upstream commit analysis
-  - name: mappings
-    type: object
-    required: true
-    description: Architecture mappings
+    description: Upstream commit summary (intent, type, risk)
   - name: conventions
     type: string
     required: false
@@ -28,22 +28,33 @@ inputs:
     type: string
     required: true
     description: Downstream file path
+  - name: upstream_path
+    type: string
+    required: false
+    description: Upstream file path that maps to this target
   - name: downstream_file
     type: string
     required: false
-    description: Current contents of the downstream file
+    description: Current contents of the downstream file (may be truncated)
+  - name: upstream_file_diff
+    type: string
+    required: false
+    description: Upstream diff for this specific file (paths rewritten downstream)
 outputs:
   - name: path
     type: string
     description: Downstream file path
+  - name: edits
+    type: list[object]
+    description: Targeted search/replace edits ({old, new}) — preferred output; small completion, applied by exact match
   - name: content
     type: string
-    description: Complete modified file content
+    description: Complete file content — only for new files that don't exist downstream
   - name: confidence
     type: string
     description: high, medium, or low
   - name: is_conflict
     type: boolean
     description: True if still cannot be resolved
-max_tokens: 16384
+max_tokens: 8192
 timeout: 180

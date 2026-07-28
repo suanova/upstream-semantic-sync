@@ -6,8 +6,14 @@ consumers.
 
 ## Input
 
-The commit diff and metadata are provided below. You do NOT need to fetch
-anything — all data is already included.
+The commit metadata, a `--stat` file list, and a **partial** diff are
+provided below. The diff may be truncated — do not assume you've seen every
+hunk. You do NOT need to fetch anything.
+
+Note: the authoritative list of changed paths is extracted from git by the
+caller — you do not need to reconstruct `affected_paths` from the diff.
+Return the paths you see in the `--stat` block as a courtesy; the caller
+will override with git's list anyway.
 
 ---
 
