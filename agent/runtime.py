@@ -762,30 +762,22 @@ def stage_resolve_conflicts(
 
         hunk_lines = _extract_hunk_lines(upstream_file_diff)
         if hunk_lines and len(downstream_file) > MAX_FILE_SIZE:
-            # Extract only the lines around the conflict, with line numbers
-            # so the LLM can locate code precisely.
+            # Extract only the lines around the conflict — raw, no line
+            # numbers.  The LLM copies `old` blocks verbatim from this text,
+            # so any prefix (line numbers) would break the exact match in
+            # apply_edits.  A header note tells it which lines are shown
+            # and that edits apply to the full file on disk.
             file_lines = downstream_file.splitlines()
             # Merge overlapping margins into a single span.
             lo = max(1, hunk_lines[0] - CONTEXT_MARGIN)
             hi = min(len(file_lines), hunk_lines[-1] + CONTEXT_MARGIN)
             snippet = file_lines[lo - 1 : hi]
-            numbered = []
-            for i, line in enumerate(snippet, start=lo):
-                numbered.append(f"{i:>5} | {line}")
-            downstream_file = "\n".join(numbered)
+            downstream_file = "\n".join(snippet)
             downstream_file = (
-                f"(showing lines {lo}–{hi} of {len(file_lines)} — "
+                f"(showing lines {lo}–{hi} of {len(file_lines)} of the file; "
                 f"edits are applied to the full file on disk)\n\n"
                 + downstream_file
             )
-        elif hunk_lines and len(downstream_file) <= MAX_FILE_SIZE:
-            # Small file — send the whole thing but with line numbers so
-            # the LLM can reference locations precisely.
-            file_lines = downstream_file.splitlines()
-            numbered = []
-            for i, line in enumerate(file_lines, start=1):
-                numbered.append(f"{i:>5} | {line}")
-            downstream_file = "\n".join(numbered)
         elif len(downstream_file) > MAX_FILE_SIZE:
             # No hunk info available — fall back to truncated head.
             downstream_file = downstream_file[:MAX_FILE_SIZE] + "\n... (truncated)"
@@ -851,7 +843,25 @@ def stage_resolve_conflicts(
                         "region": conflict.get("region", ""),
                     })
                 except ValueError as exc:
+                    # The LLM's old/new blocks didn't match.  The edits
+                    # were returned but unusable — record as an
+                    # unresolved conflict rather than silently dropping
+                    # the file, and stash the failed edits for review.
                     log.warning("Edits failed for %s: %s", result_path, exc)
+                    art = _artifacts_dir(
+                        executor.knowledge_dir,
+                        analysis_summary.get("commit_sha", "unknown"),
+                    )
+                    safe_name = result_path.replace("/", "__")
+                    try:
+                        (art / f"{safe_name}.failed_edits.json").write_text(
+                            json.dumps(
+                                {"edits": edits, "error": str(exc)},
+                                indent=2,
+                            )
+                        )
+                    except Exception:
+                        pass
                     remaining_conflicts.append({
                         "path": result_path,
                         "description": f"LLM edits did not apply: {exc}",

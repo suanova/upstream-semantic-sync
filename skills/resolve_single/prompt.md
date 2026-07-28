@@ -23,17 +23,17 @@ the upstream diff and express it in the downstream file — as a small set of
 
 - **Downstream conventions:** `{{conventions}}`
 - **Downstream file path:** `{{target_path}}`
-- **Current downstream file contents:**
+- **Current downstream file contents** (a region around the conflict
+  for large files; the whole file for small ones — copy text verbatim
+  from here into your `old` blocks):
 
 ```
 {{downstream_file}}
 ```
 
-If the file is large, only the relevant region is shown (with line
-numbers in the left margin and a note saying which lines are included).
-Edits are applied to the **full file on disk** — your `old` blocks must
-match the text exactly (strip the line-number prefix when writing `old`
-and `new`).
+The file contents are shown **exactly as they appear on disk** — no
+line-number prefixes, no escaping.  Your `old` blocks must match this
+text character-for-character.
 
 ## Output Format — targeted edits (IMPORTANT)
 
