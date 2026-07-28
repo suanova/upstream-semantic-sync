@@ -173,6 +173,24 @@ class Executor:
         if parsed is not None:
             return parsed
 
+        # The LLM sometimes returns prose instead of JSON (especially
+        # build_fix, which used to prompt the model to "read files" and
+        # "run builds" — actions it cannot take).  For skills that
+        # tolerate a fallback, return a structured default so the
+        # pipeline can continue; otherwise raise.
+        if name == "build_fix":
+            log.warning(
+                "build_fix LLM returned non-JSON — returning fail fallback. "
+                "Raw (first 300 chars): %s", raw[:300],
+            )
+            return {
+                "fixes_applied": [],
+                "unresolved": [],
+                "build_status": "fail",
+                "iterations_used": 0,
+                "_parse_error": f"LLM returned non-JSON: {raw[:200]}",
+            }
+
         raise SkillError(f"LLM output was not valid JSON.\nRaw output:\n{raw[:500]}")
 
     @staticmethod

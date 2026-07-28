@@ -920,14 +920,43 @@ def stage_resolve_conflicts(
     }
 
 
-def stage_build_fix(executor: Executor, transformations: dict, repo_path: str) -> dict:
-    """Stage 4: Fix any build failures from the transformation."""
-    log.info("Fixing build issues")
+def stage_build_fix(executor: Executor, transformations: dict, repo_path: str, conventions: str = "") -> dict:
+    """Stage 4: Fix any build failures from the transformation.
+
+    Skipped when there are no conflicts (all files applied cleanly) —
+    there is nothing to fix.  When conflicts exist, only the conflict
+    summaries are sent (not the full transformation list) to keep the
+    prompt small and avoid gateway timeouts.
+    """
+    conflicts = transformations.get("conflicts", [])
+    if not conflicts:
+        log.info("No conflicts — skipping build fix")
+        return {
+            "fixes_applied": [],
+            "unresolved": [],
+            "build_status": "pass",
+            "iterations_used": 0,
+        }
+
+    log.info("Fixing build issues (%d unresolved conflicts)", len(conflicts))
+
+    # Send only the conflict summaries — not the full transformation list.
+    # The LLM doesn't need to see clean-applied files; it only needs the
+    # files that still have problems.
+    slim_conflicts = []
+    for c in conflicts:
+        slim_conflicts.append({
+            "path": c.get("path", ""),
+            "description": c.get("description", ""),
+            "region": c.get("region", ""),
+        })
+
     return executor.run_skill(
         "build_fix",
         inputs={
-            "transformations": transformations,
-            "repo_path": repo_path,
+            "transformations": {"conflicts": slim_conflicts},
+            "build_errors": "",
+            "conventions": conventions,
         },
     )
 
@@ -1031,7 +1060,7 @@ def run_sync(
             log.info("Dry run — stopping before build fix and PR creation")
             return result
 
-        build_out = stage_build_fix(executor, apply_out, downstream_repo)
+        build_out = stage_build_fix(executor, apply_out, downstream_repo, conventions)
         result.build_status = build_out.get("build_status", "unknown")
 
         branch_name = f"sync/upstream-{commit_sha[:12]}"
@@ -1179,7 +1208,7 @@ def run_sync_batch(
         "transformations": all_transformations,
         "conflicts": all_conflicts,
     }
-    build_out = stage_build_fix(executor, combined, downstream_repo)
+    build_out = stage_build_fix(executor, combined, downstream_repo, conventions)
     result.build_status = build_out.get("build_status", "unknown")
 
     # One PR containing one commit per upstream commit.

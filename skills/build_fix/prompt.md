@@ -8,7 +8,13 @@ the build is broken.
 
 - **Transformation output:** `{{transformations}}`
 - **Build error output:** `{{build_errors}}`
-- **Downstream repo path:** `{{repo_path}}`
+- **Downstream conventions:** `{{conventions}}`
+
+## Important constraints
+
+You **cannot** read files, run builds, or execute commands. You must produce
+your fix based **only** on the context provided above. Do not narrate a plan —
+return only the JSON output format below.
 
 ## Strategy
 
@@ -18,61 +24,48 @@ Build failures after sync typically fall into these categories:
 Upstream uses different import paths than downstream. The transformation may
 have missed an import rewrite.
 
-**Fix:** Update import paths using `knowledge/mappings.yaml` import aliases.
+**Fix:** Produce edits that update import paths using the conventions.
 
 ### 2. Missing symbols
 The upstream change references a symbol that doesn't exist downstream because
 it was introduced in an earlier upstream commit that hasn't been synced yet.
 
-**Fix:** Check if the symbol exists in a pending upstream commit. If so, note
-the dependency. If not, the symbol may need to be stubbed or the transformation
-revised.
+**Fix:** Note the dependency. If no fix is possible without the missing
+symbol, flag it as unresolved.
 
 ### 3. Type mismatches
 Downstream uses different types or type hierarchies than upstream.
 
-**Fix:** Apply type mappings from `knowledge/mappings.yaml#type_aliases`. Insert
-necessary adapter code.
+**Fix:** Produce edits that apply type mappings from conventions.
 
 ### 4. API signature drift
 Downstream has evolved an API independently (fork divergence) and the upstream
 change assumes the original signature.
 
 **Fix:** Check for `SYNC:FORK_DIVERGED` markers. If present, flag for manual
-resolution. If not, adapt the call to the downstream signature.
+resolution. If not, produce edits that adapt the call to the downstream
+signature.
 
 ### 5. Test failures
 Tests may fail because they reference upstream fixtures, mock data, or test
 utilities that differ downstream.
 
-**Fix:** Update test references using the same mapping rules. Do not change
-test *intent* — only adapt paths, fixtures, and mock structure.
-
-## Steps
-
-1. Parse the build errors into structured failures (file, line, error type).
-
-2. Categorize each failure using the categories above.
-
-3. For each failure, apply the corresponding fix strategy:
-   - Read the failing file.
-   - Apply the minimal fix.
-   - Re-check that the fix is syntactically valid.
-
-4. Re-run the build (or type-check) to verify. If new failures appear,
-   iterate up to 3 times.
-
-5. If failures remain after 3 iterations, report them as unresolved.
+**Fix:** Produce edits that update test references. Do not change test
+*intent* — only adapt paths, fixtures, and mock structure.
 
 ## Output Format
+
+Return ONLY a JSON object — no text before or after.
 
 ```json
 {
   "fixes_applied": [
     {
       "path": "file/path",
-      "description": "what was fixed",
-      "diff": "unified diff"
+      "edits": [
+        {"old": "exact text from the file", "new": "replacement text"}
+      ],
+      "notes": "what was fixed"
     }
   ],
   "unresolved": [
@@ -85,7 +78,7 @@ test *intent* — only adapt paths, fixtures, and mock structure.
     }
   ],
   "build_status": "<pass|fail>",
-  "iterations_used": 2
+  "iterations_used": 0
 }
 ```
 
@@ -94,3 +87,5 @@ test *intent* — only adapt paths, fixtures, and mock structure.
 - Do not modify files outside the transformed set unless fixing imports.
 - Do not add `// @ts-ignore`, `# type: ignore`, or similar suppressions.
 - Do not delete failing tests — fix them or flag them.
+- Do NOT narrate a plan or explain what you would do — return only JSON.
+- If there are no build errors, return `{"fixes_applied": [], "unresolved": [], "build_status": "pass", "iterations_used": 0}`.

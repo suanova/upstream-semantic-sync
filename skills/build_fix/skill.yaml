@@ -1,0 +1,35 @@
+name: build_fix
+version: "1.0"
+description: |
+  Fix build failures caused by the sync transformation. Called after all
+  per-commit apply+resolve stages. Uses conventions.md to adapt fixes.
+  Returns targeted search/replace edits (not diffs) so completions stay
+  small — this avoids gateway timeouts on large transformation sets.
+inputs:
+  - name: transformations
+    type: object
+    required: true
+    description: Combined transformation output from all commits
+  - name: build_errors
+    type: string
+    required: false
+    description: Build error output (if available)
+  - name: conventions
+    type: string
+    required: false
+    description: Downstream conventions from knowledge/conventions.md
+outputs:
+  - name: fixes_applied
+    type: list[object]
+    description: Fixes applied (each with path, edits, notes)
+  - name: unresolved
+    type: list[object]
+    description: Failures that could not be fixed
+  - name: build_status
+    type: string
+    description: pass or fail
+  - name: iterations_used
+    type: integer
+    description: Number of fix iterations attempted
+max_tokens: 8192
+timeout: 300
