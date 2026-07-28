@@ -1,0 +1,49 @@
+name: resolve_single
+version: "1.0"
+description: |
+  Second-pass LLM call to resolve a conflict for a single downstream file.
+  Called once per conflict by stage_resolve_conflicts.
+inputs:
+  - name: conflict_description
+    type: string
+    required: true
+    description: Why the initial transform flagged this as a conflict
+  - name: conflict_region
+    type: string
+    required: false
+    description: Line range or symbol name of the conflict
+  - name: analysis
+    type: object
+    required: true
+    description: Upstream commit analysis
+  - name: mappings
+    type: object
+    required: true
+    description: Architecture mappings
+  - name: conventions
+    type: string
+    required: false
+    description: Downstream conventions from knowledge/conventions.md
+  - name: target_path
+    type: string
+    required: true
+    description: Downstream file path
+  - name: downstream_file
+    type: string
+    required: false
+    description: Current contents of the downstream file
+outputs:
+  - name: path
+    type: string
+    description: Downstream file path
+  - name: content
+    type: string
+    description: Complete modified file content
+  - name: confidence
+    type: string
+    description: high, medium, or low
+  - name: is_conflict
+    type: boolean
+    description: True if still cannot be resolved
+max_tokens: 16384
+timeout: 180

@@ -194,7 +194,8 @@ The sync agent will never overwrite marked regions.
 |-------|-------|--------|
 | `analyze_commit` | Commit SHA | Intent, change type, risk, surfaces |
 | `architecture_mapping` | Upstream paths | Downstream targets, unmapped paths |
-| `transform_code` | Analysis + mappings | Code diffs, conflicts |
+| `transform_single` | Analysis + mappings + one file | File content, confidence, conflicts |
+| `resolve_single` | Conflict + one file | Resolved content or remaining conflict |
 | `build_fix` | Transformations + errors | Fixes applied, unresolved failures |
 | `create_pr` | All pipeline output | PR URL and number |
 

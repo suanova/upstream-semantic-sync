@@ -291,33 +291,82 @@ def stage_map(executor: Executor, analysis: dict) -> dict:
 
 
 def stage_transform(executor: Executor, analysis: dict, mappings: dict, repo_path: str = "", conventions: str = "") -> dict:
-    """Stage 3: Transform upstream changes for downstream."""
-    log.info("Transforming code for %d targets", len(mappings.get("downstream_targets", [])))
+    """Stage 3: Transform upstream changes for downstream.
 
-    # Read the current content of each downstream target file so the LLM
-    # can produce accurate transformations instead of guessing
-    downstream_files = {}
-    for target in mappings.get("downstream_targets", []):
-        path = target.get("downstream", "")
-        if path and repo_path:
-            full = os.path.join(repo_path, path)
+    Calls the LLM once per downstream target file instead of sending all
+    targets in one giant prompt. This avoids gateway timeouts on large
+    changesets and produces better per-file results.
+    """
+    targets = mappings.get("downstream_targets", [])
+    log.info("Transforming code for %d targets (one LLM call each)", len(targets))
+
+    all_transformations: list[dict] = []
+    all_conflicts: list[dict] = []
+
+    for target in targets:
+        downstream_path = target.get("downstream", "")
+        upstream_path = target.get("upstream", "")
+
+        # Read the current downstream file content
+        downstream_file = ""
+        if downstream_path and repo_path:
+            full = os.path.join(repo_path, downstream_path)
             if os.path.exists(full):
                 try:
                     with open(full) as f:
-                        downstream_files[path] = f.read()
+                        downstream_file = f.read()
                 except Exception:
                     pass
 
-    return executor.run_skill(
-        "transform_code",
-        inputs={
-            "analysis": analysis,
-            "mappings": mappings,
-            "downstream_targets": mappings.get("downstream_targets", []),
-            "downstream_files": downstream_files,
-            "conventions": conventions,
-        },
-    )
+        log.info(
+            "Transforming %s → %s",
+            upstream_path or "?", downstream_path or "?",
+        )
+
+        try:
+            result = executor.run_skill(
+                "transform_single",
+                inputs={
+                    "analysis": analysis,
+                    "mappings": mappings,
+                    "conventions": conventions,
+                    "target_path": downstream_path,
+                    "upstream_path": upstream_path,
+                    "downstream_file": downstream_file,
+                },
+            )
+
+            if result.get("is_conflict"):
+                all_conflicts.append({
+                    "path": result.get("path", downstream_path),
+                    "description": result.get("conflict_description", ""),
+                    "region": result.get("conflict_region", ""),
+                })
+            else:
+                all_transformations.append({
+                    "path": result.get("path", downstream_path),
+                    "content": result.get("content", ""),
+                    "confidence": result.get("confidence", "low"),
+                    "notes": result.get("notes", ""),
+                })
+
+        except Exception as exc:
+            log.warning(
+                "Transform failed for %s: %s — treating as conflict",
+                downstream_path, exc,
+            )
+            all_conflicts.append({
+                "path": downstream_path,
+                "description": f"Transform call failed: {exc}",
+                "region": "",
+            })
+
+    return {
+        "transformations": all_transformations,
+        "conflicts": all_conflicts,
+        "new_mapping_candidates": [],
+        "skipped": [],
+    }
 
 
 def stage_resolve_conflicts(
@@ -330,35 +379,69 @@ def stage_resolve_conflicts(
 ) -> dict:
     """Stage 3b: Resolve transform conflicts via LLM second pass.
 
-    When the initial transform flags targets as conflicts instead of producing
-    transformations, this stage re-sends them to the LLM with a more aggressive
-    prompt that demands a resolution.
+    Calls the LLM once per conflicting file with a more aggressive prompt.
     """
-    log.info("Resolving %d conflicts via LLM second pass", len(conflicts))
+    log.info("Resolving %d conflicts via LLM second pass (one call each)", len(conflicts))
 
-    # Re-read downstream files for conflict paths
-    downstream_files = {}
-    for c in conflicts:
-        path = c.get("path", "")
+    all_transformations: list[dict] = []
+    remaining_conflicts: list[dict] = []
+
+    for conflict in conflicts:
+        path = conflict.get("path", "")
+
+        # Read the downstream file content
+        downstream_file = ""
         if path and repo_path:
             full = os.path.join(repo_path, path)
             if os.path.exists(full):
                 try:
                     with open(full) as f:
-                        downstream_files[path] = f.read()
+                        downstream_file = f.read()
                 except Exception:
                     pass
 
-    return executor.run_skill(
-        "resolve_conflict",
-        inputs={
-            "conflicts": conflicts,
-            "analysis": analysis,
-            "mappings": mappings,
-            "downstream_files": downstream_files,
-            "conventions": conventions,
-        },
-    )
+        log.info("Resolving conflict for %s", path)
+
+        try:
+            result = executor.run_skill(
+                "resolve_single",
+                inputs={
+                    "conflict_description": conflict.get("description", ""),
+                    "conflict_region": conflict.get("region", ""),
+                    "analysis": analysis,
+                    "mappings": mappings,
+                    "conventions": conventions,
+                    "target_path": path,
+                    "downstream_file": downstream_file,
+                },
+            )
+
+            if result.get("is_conflict"):
+                remaining_conflicts.append({
+                    "path": result.get("path", path),
+                    "description": result.get("conflict_description", conflict.get("description", "")),
+                    "region": result.get("conflict_region", conflict.get("region", "")),
+                })
+            else:
+                all_transformations.append({
+                    "path": result.get("path", path),
+                    "content": result.get("content", ""),
+                    "confidence": result.get("confidence", "low"),
+                    "notes": result.get("notes", ""),
+                })
+
+        except Exception as exc:
+            log.warning("Resolve failed for %s: %s", path, exc)
+            remaining_conflicts.append({
+                "path": path,
+                "description": f"Resolve call failed: {exc}",
+                "region": conflict.get("region", ""),
+            })
+
+    return {
+        "transformations": all_transformations,
+        "conflicts": remaining_conflicts,
+    }
 
 
 def stage_build_fix(executor: Executor, transformations: dict, repo_path: str) -> dict:
