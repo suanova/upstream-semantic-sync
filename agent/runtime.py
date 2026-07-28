@@ -933,14 +933,20 @@ def stage_resolve_conflicts(
 def stage_build_fix(executor: Executor, transformations: dict, repo_path: str, conventions: str = "") -> dict:
     """Stage 4: Fix any build failures from the transformation.
 
-    Skipped when there are no conflicts (all files applied cleanly) —
-    there is nothing to fix.  When conflicts exist, only the conflict
-    summaries are sent (not the full transformation list) to keep the
-    prompt small and avoid gateway timeouts.
+    This stage has no access to a real build/toolchain inside the action
+    container, so it cannot produce genuine build errors — it only has
+    the conflict descriptions left by the apply/resolve stages.  When
+    there are no conflicts, the build is assumed to pass.  When there
+    ARE conflicts, we report them as unresolved rather than spending an
+    LLM call that has nothing concrete to fix (and tends to 504/return
+    prose).
+
+    The LLM-driven build_fix is therefore disabled by default.  Set
+    BUILD_FIX_LLM=true in the environment to opt back in.
     """
     conflicts = transformations.get("conflicts", [])
     if not conflicts:
-        log.info("No conflicts — skipping build fix")
+        log.info("No conflicts — build assumed to pass")
         return {
             "fixes_applied": [],
             "unresolved": [],
@@ -948,19 +954,44 @@ def stage_build_fix(executor: Executor, transformations: dict, repo_path: str, c
             "iterations_used": 0,
         }
 
-    log.info("Fixing build issues (%d unresolved conflicts)", len(conflicts))
+    # There are unresolved conflicts.  We could ask the LLM to attempt
+    # fixes, but without real build errors it's working blind and the
+    # call frequently times out the gateway.  Report them as unresolved
+    # instead — they surface in the PR body for a human.
+    unresolved = [
+        {
+            "path": c.get("path", ""),
+            "error": c.get("description", ""),
+            "category": "unresolved_conflict",
+            "attempts": 0,
+            "suggestion": "Resolve manually — see the conflict summary in this PR.",
+        }
+        for c in conflicts
+    ]
+    log.info(
+        "Build fix: %d unresolved conflict(s) reported (LLM build_fix disabled; "
+        "set BUILD_FIX_LLM=true to enable)",
+        len(unresolved),
+    )
 
-    # Send only the conflict summaries — not the full transformation list.
-    # The LLM doesn't need to see clean-applied files; it only needs the
-    # files that still have problems.
-    slim_conflicts = []
-    for c in conflicts:
-        slim_conflicts.append({
+    if os.environ.get("BUILD_FIX_LLM", "").lower() not in ("true", "1", "yes"):
+        return {
+            "fixes_applied": [],
+            "unresolved": unresolved,
+            "build_status": "fail" if unresolved else "pass",
+            "iterations_used": 0,
+        }
+
+    # Opt-in path: send only the conflict summaries to the LLM.
+    log.info("BUILD_FIX_LLM=true — sending conflicts to LLM for fix attempts")
+    slim_conflicts = [
+        {
             "path": c.get("path", ""),
             "description": c.get("description", ""),
             "region": c.get("region", ""),
-        })
-
+        }
+        for c in conflicts
+    ]
     return executor.run_skill(
         "build_fix",
         inputs={

@@ -122,17 +122,39 @@ class Executor:
                 )
                 break  # success
             except anthropic.InternalServerError as exc:
-                # 500/502/503/504 — server-side transient errors, worth retrying
+                # 500/502/503/504 — server-side transient errors, worth
+                # retrying with exponential backoff (1s, 2s, 4s, 8s, ...).
                 last_exc = exc
                 if attempt < max_retries - 1:
-                    wait = 2 ** attempt  # 1s, 2s, 4s
+                    wait = 2 ** attempt  # 1s, 2s, 4s, ...
                     log.warning(
                         "Server error (attempt %d/%d), retrying in %ds: %s",
                         attempt + 1, max_retries, wait, exc,
                     )
                     time.sleep(wait)
                 else:
-                    raise SkillError(f"Anthropic API error after {max_retries} retries: {exc}") from exc
+                    # Final attempt failed.  Rather than crash the whole
+                    # pipeline, return a structured fallback for skills
+                    # that tolerate it (build_fix).  Other skills still
+                    # raise — analyze/resolve should propagate the error
+                    # so the commit is retried next run rather than
+                    # silently mis-synced.
+                    if name == "build_fix":
+                        log.warning(
+                            "build_fix LLM failed after %d retries — "
+                            "returning fail fallback: %s",
+                            max_retries, exc,
+                        )
+                        return {
+                            "fixes_applied": [],
+                            "unresolved": [],
+                            "build_status": "fail",
+                            "iterations_used": 0,
+                            "_error": f"build_fix LLM call failed: {exc}",
+                        }
+                    raise SkillError(
+                        f"Anthropic API error after {max_retries} retries: {exc}"
+                    ) from exc
             except anthropic.RateLimitError as exc:
                 # 429 — rate limited, back off longer
                 last_exc = exc
