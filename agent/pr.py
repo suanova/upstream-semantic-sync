@@ -122,8 +122,15 @@ def create_pr(
         _git(repo_path, "checkout", "-B", branch_name)
         pr_base = stack_base
     else:
+        # Stash all working-tree changes (including untracked) so they
+        # survive the checkout that resets the working tree to
+        # origin/base_branch.  Without this, the diffs applied by earlier
+        # pipeline stages are wiped and every bundle shows "nothing to
+        # commit".
+        _git(repo_path, "stash", "--include-untracked", check=False)
         _git(repo_path, "fetch", "origin", base_branch)
         _git(repo_path, "checkout", "-B", branch_name, f"origin/{base_branch}")
+        _git(repo_path, "stash", "pop", check=False)
         pr_base = base_branch
 
     # ── 5. Commit each upstream commit's files separately ─────────────────
