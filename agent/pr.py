@@ -149,19 +149,13 @@ def create_pr(
         for path in set(files):
             _git(repo_path, "add", "-A", "--", path, check=False)
 
-        # Stage any other working-tree changes made by earlier pipeline
-        # stages (git apply, persist_new_mappings, etc.) that aren't
-        # tracked in the transformation metadata.
+        # Also stage any other working-tree changes that were made by
+        # earlier pipeline stages (git apply, persist_new_mappings,
+        # append_changelog, etc.) but not tracked in the transformation
+        # metadata.  Without this, modified files like knowledge/mappings.yaml
+        # or diff_render.go sit in the working tree unstaged and the commit
+        # fails with "nothing to commit".
         _git(repo_path, "add", "-A", check=False)
-
-        # Unstage internal artifacts that must not be committed.
-        _git(repo_path, "reset", "HEAD", "--",
-             "knowledge/.sync-artifacts", "knowledge/.upstream-cache",
-             check=False)
-        # CHANGELOG.sync.md belongs in the last commit only; unstage
-        # it for all other bundles (the last-bundle block re-adds it).
-        if i != n_bundles - 1:
-            _git(repo_path, "reset", "HEAD", "--", "CHANGELOG.sync.md", check=False)
 
         # Changelog goes in the last commit.
         if i == n_bundles - 1:
