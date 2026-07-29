@@ -63,6 +63,7 @@ def create_pr(
     transformations: list[dict[str, Any]],
     build_result: dict[str, Any],
     stack_base: str = "",
+    base_branch: str = "",
 ) -> dict[str, Any]:
     """Create a sync branch, commit transformed files, and open a PR.
 
@@ -70,6 +71,9 @@ def create_pr(
     run), the new branch is created off it instead of the base branch, and
     the PR targets stack_base — upstream commits are sequential, so batch N's
     changes only apply correctly on top of batch N-1's.
+
+    base_branch: the downstream repo's default branch (e.g. "main").
+    If empty, falls back to HEAD / GITHUB_REF_NAME.
     """
 
     github_token = os.environ.get("GITHUB_TOKEN", "")
@@ -96,13 +100,16 @@ def create_pr(
         _git(repo_path, "remote", "add", "origin", authed_url, check=False)
 
     # ── 3. Determine base branch ──────────────────────────────────────────
-    r = _git(repo_path, "rev-parse", "--abbrev-ref", "HEAD", check=False)
-    base_branch = r.stdout.strip()
-    if not base_branch or base_branch == "HEAD":
-        base_branch = os.environ.get("GITHUB_REF_NAME", "main")
-        if base_branch.startswith("refs/heads/"):
-            base_branch = base_branch.removeprefix("refs/heads/")
-    log.info("Base branch: %s", base_branch)
+    if base_branch:
+        log.info("Base branch (from caller): %s", base_branch)
+    else:
+        r = _git(repo_path, "rev-parse", "--abbrev-ref", "HEAD", check=False)
+        base_branch = r.stdout.strip()
+        if not base_branch or base_branch == "HEAD":
+            base_branch = os.environ.get("GITHUB_REF_NAME", "main")
+            if base_branch.startswith("refs/heads/"):
+                base_branch = base_branch.removeprefix("refs/heads/")
+        log.info("Base branch (detected): %s", base_branch)
 
     # ── 4. Create the sync branch ────────────────────────────────────────
     # -B (not -b) so reruns of the same batch reset the branch cleanly.
@@ -158,7 +165,10 @@ def create_pr(
             if "nothing to commit" in (r.stdout + r.stderr).lower():
                 log.info("Bundle %d (%s): no changes — skipping empty commit", i, ref[:12] or "?")
                 continue
-            log.warning("Bundle %d commit failed: %s", i, r.stderr.strip())
+            log.error(
+                "Bundle %d commit failed (rc=%d)\n  stdout: %s\n  stderr: %s",
+                i, r.returncode, r.stdout.strip(), r.stderr.strip(),
+            )
             continue
         n_commits += 1
         log.info("Committed %s (%s)", ref[:12] or f"bundle {i}", intent[:60])

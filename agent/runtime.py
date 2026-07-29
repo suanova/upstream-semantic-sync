@@ -1011,6 +1011,7 @@ def stage_create_pr(
     branch_name: str,
     repo_path: str,
     stack_base: str = "",
+    base_branch: str = "",
 ) -> dict:
     """Stage 5: Create a consolidated pull request."""
     log.info("Creating consolidated PR for %d upstream commits", len(upstream_refs))
@@ -1024,6 +1025,7 @@ def stage_create_pr(
             "build_result": build_result,
             "repo_path": repo_path,
             "stack_base": stack_base,
+            "base_branch": base_branch,
         },
     )
 
@@ -1107,7 +1109,7 @@ def run_sync(
         branch_name = f"sync/upstream-{commit_sha[:12]}"
         pr_out = stage_create_pr(
             executor, [commit_sha], [analysis], [apply_out], build_out,
-            branch_name, downstream_repo,
+            branch_name, downstream_repo, base_branch=branch,
         )
         result.pr_url = pr_out.get("pr_url", "")
         result.pr_number = pr_out.get("pr_number", 0)
@@ -1277,7 +1279,7 @@ def run_sync_batch(
 
     pr_out = stage_create_pr(
         executor, synced_shas, result.analyses, per_commit_bundles, build_out,
-        branch_name, downstream_repo, stack_base=stack_base,
+        branch_name, downstream_repo, stack_base=stack_base, base_branch=branch,
     )
     result.pr_url = pr_out.get("pr_url", "")
     result.pr_number = pr_out.get("pr_number", 0)

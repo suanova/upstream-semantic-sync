@@ -346,6 +346,7 @@ class Executor:
             analyses=inputs.get("analyses", []),
             transformations=inputs.get("transformations", []),
             build_result=inputs.get("build_result", {}),
+            base_branch=inputs.get("base_branch", ""),
         )
 
     # ── Prompt rendering ─────────────────────────────────────────────────────
