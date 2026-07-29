@@ -145,8 +145,17 @@ def create_pr(
         if i == n_bundles - 1:
             files += [f.get("path", "") for f in build_result.get("fixes_applied", []) if f.get("path")]
 
+        # Stage the files listed in the transformation metadata.
         for path in set(files):
             _git(repo_path, "add", "-A", "--", path, check=False)
+
+        # Also stage any other working-tree changes that were made by
+        # earlier pipeline stages (git apply, persist_new_mappings,
+        # append_changelog, etc.) but not tracked in the transformation
+        # metadata.  Without this, modified files like knowledge/mappings.yaml
+        # or diff_render.go sit in the working tree unstaged and the commit
+        # fails with "nothing to commit".
+        _git(repo_path, "add", "-A", check=False)
 
         # Changelog goes in the last commit.
         if i == n_bundles - 1:
