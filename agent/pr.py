@@ -149,7 +149,11 @@ def create_pr(
         title = f"sync(upstream): {len(upstream_refs)} commits from upstream"
 
     # ── 6. Push the branch ─────────────────────────────────────────────────
-    # Use --force-with-lease to overwrite if branch existed from a prior run
+    # Fetch the remote branch (if it exists) so --force-with-lease has an
+    # up-to-date tracking ref.  Without this, a retry that reuses the same
+    # branch name fails with "stale info" because the local remote-tracking
+    # ref is out of date with what's actually on the remote.
+    _git(repo_path, "fetch", "origin", branch_name, check=False)
     _git(repo_path, "push", "--force-with-lease", "origin", branch_name)
 
     # ── 7. Create the PR via GitHub API ───────────────────────────────────
