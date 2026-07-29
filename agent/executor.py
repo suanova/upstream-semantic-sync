@@ -167,9 +167,6 @@ class Executor:
                     time.sleep(wait)
                 else:
                     raise SkillError(f"Rate limited after {max_retries} retries: {exc}") from exc
-            except anthropic.APIError as exc:
-                # Other API errors (400, 401, 403, etc.) — not retryable
-                raise SkillError(f"Anthropic API error: {exc}") from exc
             except anthropic.APIConnectionError as exc:
                 last_exc = exc
                 if attempt < max_retries - 1:
@@ -181,6 +178,11 @@ class Executor:
                     time.sleep(wait)
                 else:
                     raise SkillError(f"Cannot reach Anthropic API after {max_retries} retries: {exc}") from exc
+            except anthropic.APIError as exc:
+                # Other API errors (400, 401, 403, etc.) — not retryable.
+                # NOTE: APIConnectionError and InternalServerError are handled
+                # above; this catch must come after them.
+                raise SkillError(f"Anthropic API error: {exc}") from exc
 
         # Extract text from the response
         text_blocks = [
