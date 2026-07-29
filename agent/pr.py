@@ -13,6 +13,8 @@ import json
 import logging
 import os
 import subprocess
+import urllib.request
+import urllib.error
 from typing import Any
 
 log = logging.getLogger("sync.create_pr")
@@ -28,6 +30,29 @@ def _git(repo_path: str, *args: str, check: bool = True) -> subprocess.Completed
         log.error("git %s failed (rc=%d): %s", " ".join(args), result.returncode, result.stderr.strip())
         raise subprocess.CalledProcessError(result.returncode, ["git"] + list(args), result.stdout, result.stderr)
     return result
+
+
+def _github_api(method: str, url: str, token: str, payload: str = "") -> dict[str, Any]:
+    """Call the GitHub REST API using urllib (no curl dependency).
+
+    Returns the parsed JSON response body.  Raises on HTTP errors.
+    """
+    data = payload.encode("utf-8") if payload else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    if data:
+        req.add_header("Content-Type", "application/json")
+
+    try:
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        log.error("GitHub API %s %s failed (HTTP %d): %s", method, url, exc.code, body[:500])
+        raise RuntimeError(f"GitHub API error {exc.code}: {body[:300]}") from exc
 
 
 def create_pr(
@@ -159,13 +184,6 @@ def create_pr(
     # ── 7. Create the PR via GitHub API ───────────────────────────────────
     pr_body = _build_pr_body(upstream_refs, analyses, transformations, build_result)
 
-    api_url = f"https://api.github.com/repos/{repo_slug}/pulls"
-    headers = [
-        "-H", "Accept: application/vnd.github+json",
-        "-H", f"Authorization: Bearer {github_token}",
-        "-H", "X-GitHub-Api-Version: 2022-11-28",
-    ]
-
     has_conflicts = any(t.get("conflicts") for t in transformations)
     payload = json.dumps({
         "title": title,
@@ -175,14 +193,10 @@ def create_pr(
         "draft": has_conflicts or build_result.get("build_status") == "fail",
     })
 
-    result = subprocess.run(
-        ["curl", "-s", "-X", "POST", api_url] + headers + ["-d", payload],
-        capture_output=True, text=True, check=True,
-    )
-
-    response = json.loads(result.stdout)
-    pr_url = response.get("html_url", "")
-    pr_number = response.get("number", 0)
+    api_url = f"https://api.github.com/repos/{repo_slug}/pulls"
+    response_data = _github_api("POST", api_url, github_token, payload)
+    pr_url = response_data.get("html_url", "")
+    pr_number = response_data.get("number", 0)
 
     # ── 8. Apply labels ───────────────────────────────────────────────────
     labels = ["upstream-sync"]
@@ -197,10 +211,7 @@ def create_pr(
 
     if pr_number and labels:
         label_url = f"https://api.github.com/repos/{repo_slug}/issues/{pr_number}/labels"
-        subprocess.run(
-            ["curl", "-s", "-X", "POST", label_url] + headers + ["-d", json.dumps({"labels": labels})],
-            capture_output=True, text=True,
-        )
+        _github_api("POST", label_url, github_token, json.dumps({"labels": labels}))
 
     log.info("Created PR #%d: %s", pr_number, pr_url)
     return {"pr_url": pr_url, "pr_number": pr_number, "status": "created"}
