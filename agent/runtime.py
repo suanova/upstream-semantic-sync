@@ -254,7 +254,7 @@ class BatchResult:
     def ok(self) -> bool:
         if self.errors:
             return False
-        if self.build_status == "fail":
+        if self.failed_commits:
             return False
         if self.all_conflicts and not self.all_transformations:
             return False
