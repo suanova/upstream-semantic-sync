@@ -55,51 +55,41 @@ def _github_api(method: str, url: str, token: str, payload: str = "") -> dict[st
         raise RuntimeError(f"GitHub API error {exc.code}: {body[:300]}") from exc
 
 
-def create_pr(
+# ── Branch setup ───────────────────────────────────────────────────────────
+
+def init_branch(
     repo_path: str,
     branch_name: str,
-    upstream_refs: list[str],
-    analyses: list[dict[str, Any]],
-    transformations: list[dict[str, Any]],
-    build_result: dict[str, Any],
-    stack_base: str = "",
     base_branch: str = "",
-) -> dict[str, Any]:
-    """Create a sync branch, commit transformed files, and open a PR.
+    stack_base: str = "",
+) -> str:
+    """Configure git, create the sync branch, and return the PR base ref.
 
-    When stack_base is set (a previous sync branch from the same multi-batch
-    run), the new branch is created off it instead of the base branch, and
-    the PR targets stack_base — upstream commits are sequential, so batch N's
-    changes only apply correctly on top of batch N-1's.
+    This must be called BEFORE any apply/commit steps so the branch exists
+    and the working tree is on it.  After calling this, the caller applies
+    diffs and commits per-upstream-commit, then calls push_and_create_pr.
 
-    base_branch: the downstream repo's default branch (e.g. "main").
-    If empty, falls back to HEAD / GITHUB_REF_NAME.
+    Returns the PR base ref (stack_base or base_branch).
     """
-
     github_token = os.environ.get("GITHUB_TOKEN", "")
     repo_slug = os.environ.get("GITHUB_REPOSITORY", "")
 
-    if not github_token:
-        return {"pr_url": "", "pr_number": 0, "status": "error: GITHUB_TOKEN not set"}
-    if not repo_slug:
-        return {"pr_url": "", "pr_number": 0, "status": "error: GITHUB_REPOSITORY not set"}
-
-    # ── 0. Mark repo as safe directory (Docker runs as root, workspace is runner-owned) ──
+    # ── Mark repo as safe directory (Docker runs as root, workspace is runner-owned) ──
     _git(repo_path, "config", "--global", "--add", "safe.directory", repo_path)
 
-    # ── 1. Configure git identity ──────────────────────────────────────────
+    # ── Configure git identity ──────────────────────────────────────────
     _git(repo_path, "config", "--global", "user.name", "github-actions[bot]")
     _git(repo_path, "config", "--global", "user.email", "github-actions[bot]@users.noreply.github.com")
 
-    # ── 2. Configure authenticated push URL ────────────────────────────────
-    authed_url = f"https://x-access-token:{github_token}@github.com/{repo_slug}.git"
-    # Try set-url; if that fails, add the remote
-    r = _git(repo_path, "remote", "set-url", "origin", authed_url, check=False)
-    if r.returncode != 0:
-        log.warning("git remote set-url failed — trying remote add")
-        _git(repo_path, "remote", "add", "origin", authed_url, check=False)
+    # ── Configure authenticated push URL ────────────────────────────────
+    if github_token and repo_slug:
+        authed_url = f"https://x-access-token:{github_token}@github.com/{repo_slug}.git"
+        r = _git(repo_path, "remote", "set-url", "origin", authed_url, check=False)
+        if r.returncode != 0:
+            log.warning("git remote set-url failed — trying remote add")
+            _git(repo_path, "remote", "add", "origin", authed_url, check=False)
 
-    # ── 3. Determine base branch ──────────────────────────────────────────
+    # ── Determine base branch ──────────────────────────────────────────
     if base_branch:
         log.info("Base branch (from caller): %s", base_branch)
     else:
@@ -111,84 +101,84 @@ def create_pr(
                 base_branch = base_branch.removeprefix("refs/heads/")
         log.info("Base branch (detected): %s", base_branch)
 
-    # ── 4. Create the sync branch ────────────────────────────────────────
+    # ── Create the sync branch ────────────────────────────────────────
     # -B (not -b) so reruns of the same batch reset the branch cleanly.
     _git(repo_path, "branch", "-D", branch_name, check=False)
     if stack_base:
-        # Stacked batch: HEAD is the previous batch's branch with this
-        # batch's changes already applied in the working tree. Branch off
-        # HEAD directly; the uncommitted changes carry over untouched.
         log.info("Stacking %s on top of %s", branch_name, stack_base)
         _git(repo_path, "checkout", "-B", branch_name)
         pr_base = stack_base
     else:
-        # Stash all working-tree changes (including untracked) so they
-        # survive the checkout that resets the working tree to
-        # origin/base_branch.  Without this, the diffs applied by earlier
-        # pipeline stages are wiped and every bundle shows "nothing to
-        # commit".
-        _git(repo_path, "stash", "--include-untracked", check=False)
         _git(repo_path, "fetch", "origin", base_branch)
         _git(repo_path, "checkout", "-B", branch_name, f"origin/{base_branch}")
-        _git(repo_path, "stash", "pop", check=False)
         pr_base = base_branch
 
-    # ── 5. Commit each upstream commit's files separately ─────────────────
-    # The caller passes one transformation bundle per upstream commit, in
-    # order. We commit bundle-by-bundle so the PR contains one commit per
-    # upstream commit (preserving per-commit history) instead of a single
-    # squashed commit.
-    bundles = transformations if transformations else [{}]
-    n_bundles = len(bundles)
-    n_commits = 0
+    return pr_base
 
-    for i, bundle in enumerate(bundles):
-        # Match this bundle to its upstream ref + analysis when available.
-        ref = upstream_refs[i] if i < len(upstream_refs) else ""
-        analysis = analyses[i] if i < len(analyses) else {}
 
-        files = [f.get("path", "") for f in bundle.get("transformations", []) if f.get("path")]
-        # Build-fix fixes are appended to the LAST bundle's commit.
-        if i == n_bundles - 1:
-            files += [f.get("path", "") for f in build_result.get("fixes_applied", []) if f.get("path")]
+# ── Per-commit commit ────────────────────────────────────────────────────
 
-        # Stage the files listed in the transformation metadata.
-        for path in set(files):
-            _git(repo_path, "add", "-A", "--", path, check=False)
+def commit_bundle(
+    repo_path: str,
+    upstream_ref: str,
+    intent: str,
+    is_last: bool = False,
+) -> bool:
+    """Stage all working-tree changes and commit for one upstream commit.
 
-        # Also stage any other working-tree changes that were made by
-        # earlier pipeline stages (git apply, persist_new_mappings,
-        # append_changelog, etc.) but not tracked in the transformation
-        # metadata.  Without this, modified files like knowledge/mappings.yaml
-        # or diff_render.go sit in the working tree unstaged and the commit
-        # fails with "nothing to commit".
-        _git(repo_path, "add", "-A", check=False)
+    Returns True if a commit was created, False if nothing to commit.
+    The caller should apply the diffs for this commit BEFORE calling this.
+    """
+    _git(repo_path, "add", "-A", check=False)
 
-        # Changelog goes in the last commit.
-        if i == n_bundles - 1:
-            changelog_path = os.path.join(repo_path, "CHANGELOG.sync.md")
-            if os.path.exists(changelog_path):
-                _git(repo_path, "add", "CHANGELOG.sync.md", check=False)
+    # Changelog goes in the last commit.
+    if is_last:
+        changelog_path = os.path.join(repo_path, "CHANGELOG.sync.md")
+        if os.path.exists(changelog_path):
+            _git(repo_path, "add", "CHANGELOG.sync.md", check=False)
 
-        intent = analysis.get("intent", "") or "upstream sync"
-        if ref:
-            msg = f"sync(upstream): {intent}\n\nUpstream-commit: {ref}"
-        else:
-            msg = f"sync(upstream): {intent}"
+    if upstream_ref:
+        msg = f"sync(upstream): {intent}\n\nUpstream-commit: {upstream_ref}"
+    else:
+        msg = f"sync(upstream): {intent}"
 
-        r = _git(repo_path, "commit", "-m", msg, check=False)
-        if r.returncode != 0:
-            if "nothing to commit" in (r.stdout + r.stderr).lower():
-                log.info("Bundle %d (%s): no changes — skipping empty commit", i, ref[:12] or "?")
-                continue
-            log.error(
-                "Bundle %d commit failed (rc=%d)\n  stdout: %s\n  stderr: %s",
-                i, r.returncode, r.stdout.strip(), r.stderr.strip(),
-            )
-            continue
-        n_commits += 1
-        log.info("Committed %s (%s)", ref[:12] or f"bundle {i}", intent[:60])
+    r = _git(repo_path, "commit", "-m", msg, check=False)
+    if r.returncode != 0:
+        if "nothing to commit" in (r.stdout + r.stderr).lower():
+            log.info("Commit %s: no changes — skipping", upstream_ref[:12] or "?")
+            return False
+        log.error(
+            "Commit %s failed (rc=%d)\n  stdout: %s\n  stderr: %s",
+            upstream_ref[:12] or "?", r.returncode, r.stdout.strip(), r.stderr.strip(),
+        )
+        return False
+    log.info("Committed %s (%s)", upstream_ref[:12] or "?", intent[:60])
+    return True
 
+
+# ── Push + PR creation ──────────────────────────────────────────────────
+
+def push_and_create_pr(
+    repo_path: str,
+    branch_name: str,
+    pr_base: str,
+    upstream_refs: list[str],
+    analyses: list[dict[str, Any]],
+    transformations: list[dict[str, Any]],
+    build_result: dict[str, Any],
+    n_commits: int,
+) -> dict[str, Any]:
+    """Push the branch and create a pull request via the GitHub API.
+
+    Called after all per-commit apply+commit steps are done.
+    """
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    repo_slug = os.environ.get("GITHUB_REPOSITORY", "")
+
+    if not github_token:
+        return {"pr_url": "", "pr_number": 0, "status": "error: GITHUB_TOKEN not set"}
+    if not repo_slug:
+        return {"pr_url": "", "pr_number": 0, "status": "error: GITHUB_REPOSITORY not set"}
     if n_commits == 0:
         log.warning("Nothing to commit — no changes detected")
         return {"pr_url": "", "pr_number": 0, "status": "no_changes"}
@@ -199,15 +189,11 @@ def create_pr(
     else:
         title = f"sync(upstream): {len(upstream_refs)} commits from upstream"
 
-    # ── 6. Push the branch ─────────────────────────────────────────────────
-    # Fetch the remote branch (if it exists) so --force-with-lease has an
-    # up-to-date tracking ref.  Without this, a retry that reuses the same
-    # branch name fails with "stale info" because the local remote-tracking
-    # ref is out of date with what's actually on the remote.
+    # ── Push the branch ─────────────────────────────────────────────────
     _git(repo_path, "fetch", "origin", branch_name, check=False)
     _git(repo_path, "push", "--force-with-lease", "origin", branch_name)
 
-    # ── 7. Create the PR via GitHub API ───────────────────────────────────
+    # ── Create the PR via GitHub API ───────────────────────────────────
     pr_body = _build_pr_body(upstream_refs, analyses, transformations, build_result)
 
     has_conflicts = any(t.get("conflicts") for t in transformations)
@@ -224,7 +210,7 @@ def create_pr(
     pr_url = response_data.get("html_url", "")
     pr_number = response_data.get("number", 0)
 
-    # ── 8. Apply labels ───────────────────────────────────────────────────
+    # ── Apply labels ───────────────────────────────────────────────────
     labels = ["upstream-sync"]
     if any(a.get("change_type") == "breaking" for a in analyses):
         labels.append("breaking-change")
@@ -243,7 +229,46 @@ def create_pr(
     return {"pr_url": pr_url, "pr_number": pr_number, "status": "created"}
 
 
-# ── PR body builder ──────────────────────────────────────────────────────────
+# ── Legacy entry point (for backward compat) ────────────────────────────
+
+def create_pr(
+    repo_path: str,
+    branch_name: str,
+    upstream_refs: list[str],
+    analyses: list[dict[str, Any]],
+    transformations: list[dict[str, Any]],
+    build_result: dict[str, Any],
+    stack_base: str = "",
+    base_branch: str = "",
+) -> dict[str, Any]:
+    """Create a sync branch, commit transformed files, and open a PR.
+
+    Legacy entry point that does init + per-bundle commit + push in one
+    call.  Prefer init_branch / commit_bundle / push_and_create_pr for
+    new callers so that apply and commit are interleaved per-upstream-commit.
+    """
+    pr_base = init_branch(repo_path, branch_name, base_branch, stack_base)
+
+    bundles = transformations if transformations else [{}]
+    n_bundles = len(bundles)
+    n_commits = 0
+
+    for i, bundle in enumerate(bundles):
+        ref = upstream_refs[i] if i < len(upstream_refs) else ""
+        analysis = analyses[i] if i < len(analyses) else {}
+        intent = analysis.get("intent", "") or "upstream sync"
+
+        if commit_bundle(repo_path, ref, intent, is_last=(i == n_bundles - 1)):
+            n_commits += 1
+
+    return push_and_create_pr(
+        repo_path, branch_name, pr_base,
+        upstream_refs, analyses, transformations, build_result,
+        n_commits,
+    )
+
+
+# ── PR body builder ──────────────────────────────────────────────────────
 
 def _build_pr_body(
     upstream_refs: list[str],

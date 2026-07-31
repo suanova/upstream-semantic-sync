@@ -1010,10 +1010,15 @@ def stage_create_pr(
     build_result: dict,
     branch_name: str,
     repo_path: str,
+    pr_base: str,
+    n_commits: int,
     stack_base: str = "",
     base_branch: str = "",
 ) -> dict:
-    """Stage 5: Create a consolidated pull request."""
+    """Stage 5: Push the branch and create a consolidated pull request.
+
+    Assumes the branch already exists with commits applied by the caller.
+    """
     log.info("Creating consolidated PR for %d upstream commits", len(upstream_refs))
     return executor.run_skill(
         "create_pr",
@@ -1024,6 +1029,8 @@ def stage_create_pr(
             "transformations": transformations,
             "build_result": build_result,
             "repo_path": repo_path,
+            "pr_base": pr_base,
+            "n_commits": n_commits,
             "stack_base": stack_base,
             "base_branch": base_branch,
         },
@@ -1040,6 +1047,8 @@ def run_sync(
     dry_run: bool = False,
 ) -> SyncResult:
     """Run the full sync pipeline for a single upstream commit."""
+
+    from agent.pr import init_branch, commit_bundle, push_and_create_pr
 
     result = SyncResult(commit_sha=commit_sha)
     knowledge_dir = resolve_knowledge_dir(downstream_repo)
@@ -1077,6 +1086,10 @@ def run_sync(
         mappings = stage_map(executor, analysis)
         result.downstream_targets = mappings.get("downstream_targets", [])
 
+        # Create branch before applying, so commits land directly on it.
+        branch_name = f"sync/upstream-{commit_sha[:12]}"
+        pr_base = init_branch(downstream_repo, branch_name, base_branch=branch)
+
         # Apply upstream diffs directly — no LLM for clean applies
         apply_out = stage_apply_direct(analysis, mappings, downstream_repo, knowledge_dir)
         result.transformations = apply_out.get("transformations", [])
@@ -1099,6 +1112,10 @@ def run_sync(
             # Keep only truly unresolved conflicts
             result.conflicts = resolve_out.get("conflicts", [])
 
+        # Commit immediately after applying this commit's changes.
+        intent = analysis.get("intent", "") or "upstream sync"
+        n_commits = 1 if commit_bundle(downstream_repo, commit_sha, intent, is_last=True) else 0
+
         if dry_run:
             log.info("Dry run — stopping before build fix and PR creation")
             return result
@@ -1106,20 +1123,21 @@ def run_sync(
         build_out = stage_build_fix(executor, apply_out, downstream_repo, conventions)
         result.build_status = build_out.get("build_status", "unknown")
 
-        branch_name = f"sync/upstream-{commit_sha[:12]}"
-        pr_out = stage_create_pr(
-            executor, [commit_sha], [analysis], [apply_out], build_out,
-            branch_name, downstream_repo, base_branch=branch,
-        )
-        result.pr_url = pr_out.get("pr_url", "")
-        result.pr_number = pr_out.get("pr_number", 0)
-
         # Record adopted commit in changelog
         append_changelog(downstream_repo, upstream_repo, branch, [commit_sha], [analysis])
 
         new_mappings = mappings.get("new_mappings", [])
         if new_mappings:
             planner.persist_new_mappings(new_mappings)
+
+        # Push + create PR
+        pr_out = push_and_create_pr(
+            downstream_repo, branch_name, pr_base,
+            [commit_sha], [analysis], [apply_out], build_out,
+            n_commits,
+        )
+        result.pr_url = pr_out.get("pr_url", "")
+        result.pr_number = pr_out.get("pr_number", 0)
 
     except Exception as exc:
         log.exception("Pipeline failed for commit %s", commit_sha)
@@ -1138,11 +1156,17 @@ def run_sync_batch(
     dry_run: bool = False,
     stack_base: str = "",
 ) -> BatchResult:
-    """Analyze/map/apply each commit, then create one consolidated PR.
+    """Analyze/map/apply each commit, committing after each, then create one PR.
+
+    The key design: apply and commit are interleaved per-upstream-commit.
+    For each commit: apply its diffs → commit immediately. This avoids the
+    old problem where a checkout wiped all accumulated working-tree changes.
 
     stack_base: name of a previous batch's sync branch to stack this batch's
     PR on (used by chunked multi-batch runs in --since-last mode).
     """
+
+    from agent.pr import init_branch, commit_bundle, push_and_create_pr
 
     result = BatchResult(commit_shas=commits)
     knowledge_dir = resolve_knowledge_dir(downstream_repo)
@@ -1152,11 +1176,23 @@ def run_sync_batch(
 
     all_transformations: list[dict] = []
     all_conflicts: list[dict] = []
-    # Per-commit bundles so create_pr can make one commit per upstream commit.
     synced_shas: list[str] = []
     per_commit_bundles: list[dict] = []
+    n_commits = 0
 
-    for sha in commits:
+    # ── Create the sync branch up front ────────────────────────────────
+    first_sha = commits[0]
+    last_sha = commits[-1]
+    if first_sha == last_sha:
+        branch_name = f"sync/upstream-{first_sha[:12]}"
+    else:
+        branch_name = f"sync/upstream-{first_sha[:12]}-{last_sha[:12]}"
+
+    pr_base = init_branch(downstream_repo, branch_name, base_branch=branch, stack_base=stack_base)
+
+    # ── Per-commit: analyze → apply → commit ──────────────────────────
+    for idx, sha in enumerate(commits):
+        is_last = (idx == len(commits) - 1)
         try:
             # SHA blocklist is a pure string match — check it before
             # spending an LLM call on analysis.
@@ -1221,6 +1257,11 @@ def run_sync_batch(
             if new_mappings:
                 planner.persist_new_mappings(new_mappings)
 
+            # ── Commit this upstream commit's changes immediately ──────
+            intent = analysis.get("intent", "") or "upstream sync"
+            if commit_bundle(downstream_repo, sha, intent, is_last=is_last):
+                n_commits += 1
+
         except Exception as exc:
             log.exception("Failed to process commit %s", sha)
             result.failed_commits.append(sha)
@@ -1254,19 +1295,14 @@ def run_sync_batch(
     build_out = stage_build_fix(executor, combined, downstream_repo, conventions)
     result.build_status = build_out.get("build_status", "unknown")
 
-    # One PR containing one commit per upstream commit.
-    first_sha = commits[0]
-    last_sha = commits[-1]
-    if first_sha == last_sha:
-        branch_name = f"sync/upstream-{first_sha[:12]}"
-    else:
-        branch_name = f"sync/upstream-{first_sha[:12]}-{last_sha[:12]}"
-
-    # Write the changelog + advance the sync pointer BEFORE creating the PR,
-    # so both ride into the PR's last commit (previously they were written
-    # after create_pr, so they never made it into the branch).
+    # Write the changelog + advance the sync pointer BEFORE pushing,
+    # so both ride into the branch's last commit.
     adopted_shas = [a["commit_sha"] for a in result.analyses if "commit_sha" in a]
     append_changelog(downstream_repo, upstream_repo, branch, adopted_shas, result.analyses)
+
+    # Commit any remaining changes (changelog, build-fix artifacts).
+    if commit_bundle(downstream_repo, "", "changelog and sync artifacts", is_last=True):
+        n_commits += 1
 
     old_sync_state = planner.get_last_synced_sha(upstream_repo, branch)
     advanced = False
@@ -1277,9 +1313,11 @@ def run_sync_batch(
     else:
         log.warning("No transformations applied — not advancing last synced SHA")
 
-    pr_out = stage_create_pr(
-        executor, synced_shas, result.analyses, per_commit_bundles, build_out,
-        branch_name, downstream_repo, stack_base=stack_base, base_branch=branch,
+    # ── Push + create PR ───────────────────────────────────────────────
+    pr_out = push_and_create_pr(
+        downstream_repo, branch_name, pr_base,
+        synced_shas, result.analyses, per_commit_bundles, build_out,
+        n_commits,
     )
     result.pr_url = pr_out.get("pr_url", "")
     result.pr_number = pr_out.get("pr_number", 0)

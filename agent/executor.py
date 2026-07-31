@@ -337,18 +337,24 @@ class Executor:
         }
 
     def _run_create_pr(self, inputs: dict[str, Any]) -> dict[str, Any]:
-        """Create a PR using the local Python handler (git + GitHub API)."""
+        """Push a branch and create a PR via the GitHub API.
 
-        from agent.pr import create_pr
+        The branch and its commits must already exist — this only pushes
+        and creates the PR.  For the legacy all-in-one entry point, see
+        create_pr() in pr.py.
+        """
 
-        return create_pr(
+        from agent.pr import push_and_create_pr
+
+        return push_and_create_pr(
             repo_path=inputs.get("repo_path", ""),
             branch_name=inputs.get("branch_name", ""),
+            pr_base=inputs.get("pr_base", ""),
             upstream_refs=inputs.get("upstream_refs", []),
             analyses=inputs.get("analyses", []),
             transformations=inputs.get("transformations", []),
             build_result=inputs.get("build_result", {}),
-            base_branch=inputs.get("base_branch", ""),
+            n_commits=inputs.get("n_commits", 0),
         )
 
     # ── Prompt rendering ─────────────────────────────────────────────────────
