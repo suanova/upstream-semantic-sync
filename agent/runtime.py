@@ -1378,10 +1378,10 @@ def main() -> None:
     )
     parser.add_argument("--branch", default="main", help="Upstream branch (default: main)")
     parser.add_argument(
-        "--limit", type=int, default=10,
+        "--limit", type=int, default=0,
         help="Commits per batch/PR. If more new commits exist, the runtime "
              "loops over additional batches, stacking each PR on the previous "
-             "(0 = single batch with everything). Default: 10",
+             "(0 = single batch with everything). Default: 0",
     )
     parser.add_argument("--dry-run", action="store_true", help="Stop before creating PR")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
