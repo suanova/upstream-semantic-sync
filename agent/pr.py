@@ -202,7 +202,7 @@ def push_and_create_pr(
         "head": branch_name,
         "base": pr_base,
         "body": pr_body,
-        "draft": has_conflicts or build_result.get("build_status") == "fail",
+        "draft": False,
     })
 
     api_url = f"https://api.github.com/repos/{repo_slug}/pulls"
