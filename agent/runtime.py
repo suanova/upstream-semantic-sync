@@ -1300,18 +1300,19 @@ def run_sync_batch(
     adopted_shas = [a["commit_sha"] for a in result.analyses if "commit_sha" in a]
     append_changelog(downstream_repo, upstream_repo, branch, adopted_shas, result.analyses)
 
-    # Commit any remaining changes (changelog, build-fix artifacts).
-    if commit_bundle(downstream_repo, "", "changelog and sync artifacts", is_last=True):
-        n_commits += 1
-
     old_sync_state = planner.get_last_synced_sha(upstream_repo, branch)
     advanced = False
-    if all_transformations:
-        planner.set_last_synced_sha(upstream_repo, branch, last_sha)
+    if synced_shas:
+        last_synced = synced_shas[-1]
+        planner.set_last_synced_sha(upstream_repo, branch, last_synced)
         advanced = True
-        log.info("Advanced last synced SHA to %s", last_sha[:12])
+        log.info("Advanced last synced SHA to %s", last_synced[:12])
     else:
         log.warning("No transformations applied — not advancing last synced SHA")
+
+    # Commit any remaining changes (changelog, mappings.yaml, build-fix artifacts).
+    if commit_bundle(downstream_repo, "", "changelog and sync artifacts", is_last=True):
+        n_commits += 1
 
     # ── Push + create PR ───────────────────────────────────────────────
     pr_out = push_and_create_pr(
